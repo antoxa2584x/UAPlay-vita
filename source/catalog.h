@@ -44,7 +44,50 @@ typedef struct {
 void catalog_http_init(void);
 void catalog_http_cleanup(void);
 /* Give the calling thread (the source prefetch worker) its own pool. */
+/* Roles for the calling thread: a source search worker (queued
+   background, served first) or a foreground job the user waits on (never
+   queued). Other non-UI threads count as catalogue background work. */
 void catalog_http_bind_source_thread(void);
+void catalog_http_bind_foreground_thread(void);
+/* Requests made by the calling thread so far, for per-search counts. */
+unsigned net_thread_request_count(void);
+/* Background network gate (PS Vita). Its Wi-Fi is weak, so catalogue
+   paging, source prefetch and poster downloads take turns: one request at
+   a time, source prefetch first, none while a video plays. Requests made
+   on the UI thread, which the user is waiting for, never wait here. */
+void net_background_acquire(int priority);
+void net_background_release(int priority);
+void net_background_pause(int paused);
+/* Wakes every waiter for good; call before joining worker threads. */
+void net_background_shutdown(void);
+/* Background requests in flight and waiting, for the profiler. */
+void net_background_stats(int *active,int *waiting);
+
+/* Request timings for the profiler. Kinds: 'U' UI thread, 'C' catalogue
+   worker, 'S' source prefetch, 'P' posters. Times are milliseconds; tls
+   and connect are 0 when a kept-alive connection was reused. */
+typedef struct {
+    unsigned sequence,at;
+    char kind,host[39];
+    int wait,dns,connect,tls,first_byte,total;
+    long status;
+    int result;
+    unsigned bytes;
+    char error[96];   /* curl's error text for a failed request */
+} NetSample;
+void net_profile_record(char kind,void *curl,const char *url,unsigned wait_ms,
+                        int result,unsigned bytes,const char *error);
+/* Copies samples newer than sequence after, oldest first; returns count. */
+int net_profile_since(unsigned after,NetSample *out,int max);
+unsigned net_request_count(char kind);
+/* Certificate verification for a curl handle. On the Vita every handle
+   shares one store parsed once from the bundled CA list (re-reading the
+   PEM file per handle took seconds there); elsewhere it sets CAINFO. */
+void net_tls_options(void *curl);
+/* Certificates loaded and skipped, and the one-off parse time. */
+void net_tls_stats(int *loaded,int *skipped,double *milliseconds);
+/* One line on the TLS library: version, RNG state, first CA error. */
+void net_tls_info(char *out,int size);
 
 /* NRO includes a public TMDB key; optional SD override under switch/uaplay. */
 int catalog_load(const char *category, const char *query, Movie *items, int max,

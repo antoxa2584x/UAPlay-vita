@@ -1,5 +1,7 @@
 #include "vita_platform.h"
 
+#include <malloc.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -26,8 +28,10 @@ unsigned int sceUserMainThreadStackSize = 2 * 1024 * 1024;
 
 static int enter_circle;
 static int network_ready;
+static SceUInt64 boot_marks[6];
 
 int vita_platform_init(void) {
+    boot_marks[0] = sceKernelGetProcessTimeWide();
     sceAppUtilInit(&(SceAppUtilInitParam){0}, &(SceAppUtilBootParam){0});
     SceCommonDialogConfigParam config;
     sceCommonDialogConfigParamInit(&config);
@@ -37,13 +41,36 @@ int vita_platform_init(void) {
     config.enterButtonAssign = button;
     enter_circle = button == SCE_SYSTEM_PARAM_ENTER_BUTTON_CIRCLE;
     sceCommonDialogSetConfigParam(&config);
+    boot_marks[1] = sceKernelGetProcessTimeWide();
+
+    /* Apps start at 333 MHz CPU and 111 MHz GPU; the blended, rounded UI
+       and the software decoder fallback need the full clocks. */
+    scePowerSetArmClockFrequency(444);
+    scePowerSetBusClockFrequency(222);
+    scePowerSetGpuClockFrequency(222);
+    scePowerSetGpuXbarClockFrequency(166);
+    boot_marks[2] = sceKernelGetProcessTimeWide();
 
     mkdir(UAPLAY_DATA_DIR, 0777);
     mpv_vita_preinit();
+    boot_marks[3] = sceKernelGetProcessTimeWide();
+    /* vitaGL init took 2.8 s; skip claiming the physically contiguous and
+       dialog pools, which the UI's textures never use. */
+    vglUseExtraMem(GL_FALSE);
     /* The result only reports whether the resolution had to be lowered. */
     vglInitExtended(0, VITA_SCREEN_W, VITA_SCREEN_H, 16 * 1024 * 1024,
                     SCE_GXM_MULTISAMPLE_NONE);
+    boot_marks[4] = sceKernelGetProcessTimeWide();
     return 1;
+}
+
+void vita_boot_info(char *out, size_t size) {
+    snprintf(out, size, "platform ms: process start %u, dialogs %u, clocks %u, decoder %u, vitaGL %u",
+             (unsigned)(boot_marks[0] / 1000),
+             (unsigned)((boot_marks[1] - boot_marks[0]) / 1000),
+             (unsigned)((boot_marks[2] - boot_marks[1]) / 1000),
+             (unsigned)((boot_marks[3] - boot_marks[2]) / 1000),
+             (unsigned)((boot_marks[4] - boot_marks[3]) / 1000));
 }
 
 int vita_network_init(void) {
@@ -215,8 +242,28 @@ void vita_poll_touch(void) {
     previous_count = count;
 }
 
+void vita_profile_info(char *out, size_t size) {
+    struct mallinfo heap = mallinfo();
+    size_t used = (size_t)heap.uordblks;
+    size_t heap_free = used < (size_t)_newlib_heap_size_user ?
+                       (size_t)_newlib_heap_size_user - used : 0;
+    snprintf(out, size, "CPU %d / GPU %d MHz   heap free %u MB   GPU mem free %u MB (CDRAM %u)",
+             scePowerGetArmClockFrequency(), scePowerGetGpuClockFrequency(),
+             (unsigned)(heap_free >> 20), (unsigned)(vglMemFree(VGL_MEM_ALL) >> 20),
+             (unsigned)(vglMemFree(VGL_MEM_VRAM) >> 20));
+}
+
 int vita_battery(int *charging) {
-    if (charging) *charging = scePowerIsBatteryCharging() > 0;
-    int percent = scePowerGetBatteryLifePercent();
-    return percent >= 0 && percent <= 100 ? percent : -1;
+    /* Drawn every frame; the gauge only needs a reading per second. */
+    static Uint32 read_at;
+    static int percent = -1, plugged;
+    Uint32 now = SDL_GetTicks();
+    if (!read_at || now - read_at >= 1000) {
+        plugged = scePowerIsBatteryCharging() > 0;
+        int value = scePowerGetBatteryLifePercent();
+        percent = value >= 0 && value <= 100 ? value : -1;
+        read_at = now ? now : 1;
+    }
+    if (charging) *charging = plugged;
+    return percent;
 }

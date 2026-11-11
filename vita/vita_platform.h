@@ -23,5 +23,9 @@ void vita_swap(void);
 void vita_poll_touch(void);
 /* Battery charge 0-100 (or -1 when unknown) and whether it is charging. */
 int vita_battery(int *charging);
+/* One profiler line: clocks, free heap and free GPU memory. */
+void vita_profile_info(char *out, size_t size);
+/* Timings of the steps inside vita_platform_init. */
+void vita_boot_info(char *out, size_t size);
 
 #endif

@@ -12,6 +12,13 @@
 #ifdef UAPLAY_CONSOLE
 #include <SDL.h>
 #endif
+#ifdef __vita__
+#include <openssl/err.h>
+#include <openssl/pem.h>
+#include <openssl/rand.h>
+#include <openssl/ssl.h>
+#include <openssl/x509.h>
+#endif
 
 #define TMDB_KEY_PATH UAPLAY_DATA_DIR "/tmdb.key"
 #define TMDB_LEGACY_KEY_PATH UAPLAY_DATA_ROOT "/lampa-nx/tmdb.key"
@@ -51,9 +58,241 @@ static SDL_mutex *country_cache_mutex;
    new connections even though existing poster requests still work. Keep
    one reusable handle per calling thread, never shared concurrently. */
 #ifdef UAPLAY_CONSOLE
-static SDL_threadID catalog_ui_thread,catalog_source_thread;
-/* 0: UI thread, 1: catalogue worker, 2: source prefetch worker. */
-static CURL *catalog_connections[3];
+static SDL_threadID catalog_ui_thread;
+/* Each thread gets its own handle on first use. Role 'U' is the UI or a
+   foreground job, 'S' a source search worker, 'C' other background work. */
+typedef struct { SDL_threadID id; char role; CURL *curl; unsigned requests; } HttpThread;
+#define HTTP_THREADS 12
+static HttpThread http_threads[HTTP_THREADS];
+static int http_thread_count;
+static SDL_SpinLock http_threads_lock;
+static HttpThread *http_thread(void){
+    SDL_threadID self=SDL_ThreadID();
+    HttpThread *found=NULL;
+    SDL_AtomicLock(&http_threads_lock);
+    for(int i=0;i<http_thread_count && !found;i++)
+        if(http_threads[i].id==self)found=&http_threads[i];
+    if(!found && http_thread_count<HTTP_THREADS){
+        found=&http_threads[http_thread_count++];
+        *found=(HttpThread){self,self==catalog_ui_thread?'U':'C',NULL,0};
+    }
+    SDL_AtomicUnlock(&http_threads_lock);
+    return found;
+}
+#endif
+
+#define NET_SAMPLES 128
+static NetSample net_samples[NET_SAMPLES];
+static unsigned net_sequence,net_counts[4];
+#ifdef UAPLAY_CONSOLE
+static SDL_SpinLock net_profile_lock;
+#define NET_PROFILE_LOCK() SDL_AtomicLock(&net_profile_lock)
+#define NET_PROFILE_UNLOCK() SDL_AtomicUnlock(&net_profile_lock)
+static unsigned net_ticks(void){return SDL_GetTicks();}
+#else
+#define NET_PROFILE_LOCK() ((void)0)
+#define NET_PROFILE_UNLOCK() ((void)0)
+static unsigned net_ticks(void){return 0;}
+#endif
+static int net_kind_index(char kind){
+    return kind=='U'?0:kind=='C'?1:kind=='S'?2:3;
+}
+void net_profile_record(char kind,void *handle,const char *url,unsigned wait_ms,
+                        int result,unsigned bytes,const char *error){
+    NetSample sample;
+    memset(&sample,0,sizeof(sample));
+    sample.at=net_ticks();
+    sample.kind=kind;
+    sample.wait=(int)wait_ms;
+    sample.result=result;
+    sample.bytes=bytes;
+    if(result && error)snprintf(sample.error,sizeof(sample.error),"%s",error);
+    const char *host=url?strstr(url,"://"):NULL;
+    host=host?host+3:url?url:"";
+    size_t n=strcspn(host,"/:?");
+    if(n>=sizeof(sample.host))n=sizeof(sample.host)-1;
+    memcpy(sample.host,host,n);
+    CURL *curl=handle;
+    if(curl){
+        curl_off_t dns=0,connect=0,tls=0,first=0,total=0;
+        curl_easy_getinfo(curl,CURLINFO_NAMELOOKUP_TIME_T,&dns);
+        curl_easy_getinfo(curl,CURLINFO_CONNECT_TIME_T,&connect);
+        curl_easy_getinfo(curl,CURLINFO_APPCONNECT_TIME_T,&tls);
+        curl_easy_getinfo(curl,CURLINFO_STARTTRANSFER_TIME_T,&first);
+        curl_easy_getinfo(curl,CURLINFO_TOTAL_TIME_T,&total);
+        curl_easy_getinfo(curl,CURLINFO_RESPONSE_CODE,&sample.status);
+        /* curl reports cumulative microseconds from the request start. */
+        sample.dns=(int)(dns/1000);
+        sample.connect=connect>dns?(int)((connect-dns)/1000):0;
+        sample.tls=tls>connect?(int)((tls-connect)/1000):0;
+        sample.first_byte=(int)(first/1000);
+        sample.total=(int)(total/1000);
+    }
+    NET_PROFILE_LOCK();
+    sample.sequence=++net_sequence;
+    net_samples[sample.sequence%NET_SAMPLES]=sample;
+    net_counts[net_kind_index(kind)]++;
+    NET_PROFILE_UNLOCK();
+}
+int net_profile_since(unsigned after,NetSample *out,int max){
+    int count=0;
+    NET_PROFILE_LOCK();
+    unsigned first=net_sequence>NET_SAMPLES?net_sequence-NET_SAMPLES+1:1;
+    if(after+1>first)first=after+1;
+    if(net_sequence>=first && net_sequence-first+1>(unsigned)max)
+        first=net_sequence-(unsigned)max+1;
+    for(unsigned i=first;i<=net_sequence;i++)out[count++]=net_samples[i%NET_SAMPLES];
+    NET_PROFILE_UNLOCK();
+    return count;
+}
+unsigned net_request_count(char kind){
+    NET_PROFILE_LOCK();
+    unsigned count=net_counts[net_kind_index(kind)];
+    NET_PROFILE_UNLOCK();
+    return count;
+}
+
+#ifdef __vita__
+static SDL_mutex *ca_mutex;
+static X509_STORE *ca_store;
+static int ca_attempted,ca_loaded,ca_skipped;
+static double ca_ms;
+static char ca_error[120];
+/* Parse the bundle once. A certificate OpenSSL cannot read is skipped
+   rather than failing the whole list, as SSL_CTX_load_verify_locations
+   would. */
+static X509_STORE *ca_store_get(void){
+    if(ca_mutex)SDL_LockMutex(ca_mutex);
+    if(!ca_attempted){
+        ca_attempted=1;
+        Uint64 started=SDL_GetPerformanceCounter();
+        BIO *bio=BIO_new_file(UAPLAY_CA_BUNDLE,"r");
+        X509_STORE *store=bio?X509_STORE_new():NULL;
+        while(store){
+            X509 *cert=PEM_read_bio_X509(bio,NULL,NULL,NULL);
+            if(!cert){
+                unsigned long error=ERR_peek_last_error();
+                ERR_clear_error();
+                if(ERR_GET_REASON(error)==PEM_R_NO_START_LINE || ++ca_skipped>64)break;
+                if(!ca_error[0])ERR_error_string_n(error,ca_error,sizeof(ca_error));
+                continue;
+            }
+            if(X509_STORE_add_cert(store,cert))ca_loaded++;
+            else{
+                unsigned long error=ERR_peek_last_error();
+                if(!ca_error[0])ERR_error_string_n(error,ca_error,sizeof(ca_error));
+                ca_skipped++;ERR_clear_error();
+            }
+            X509_free(cert);
+        }
+        if(bio)BIO_free(bio);
+        if(store && !ca_loaded){X509_STORE_free(store);store=NULL;}
+        ca_store=store;
+        ca_ms=(double)(SDL_GetPerformanceCounter()-started)*1000.0/
+              (double)SDL_GetPerformanceFrequency();
+    }
+    X509_STORE *store=ca_store;
+    if(store)X509_STORE_up_ref(store);
+    if(ca_mutex)SDL_UnlockMutex(ca_mutex);
+    return store;
+}
+static CURLcode ca_attach(CURL *curl,void *ssl_ctx,void *opaque){
+    (void)curl;(void)opaque;
+    X509_STORE *store=ca_store_get();
+    if(!store)return CURLE_SSL_CACERT_BADFILE;
+    SSL_CTX_set_cert_store((SSL_CTX *)ssl_ctx,store);   /* takes our reference */
+    return CURLE_OK;
+}
+void net_tls_options(void *handle){
+    CURL *curl=handle;
+    curl_easy_setopt(curl,CURLOPT_CAINFO,NULL);
+    curl_easy_setopt(curl,CURLOPT_CAPATH,NULL);
+    curl_easy_setopt(curl,CURLOPT_CA_CACHE_TIMEOUT,0L);
+    curl_easy_setopt(curl,CURLOPT_SSL_CTX_FUNCTION,ca_attach);
+}
+void net_tls_stats(int *loaded,int *skipped,double *milliseconds){
+    if(ca_mutex)SDL_LockMutex(ca_mutex);
+    *loaded=ca_loaded;*skipped=ca_skipped;*milliseconds=ca_ms;
+    if(ca_mutex)SDL_UnlockMutex(ca_mutex);
+}
+void net_tls_info(char *out,int size){
+    char error[120];
+    if(ca_mutex)SDL_LockMutex(ca_mutex);
+    snprintf(error,sizeof(error),"%s",ca_error[0]?ca_error:"none");
+    if(ca_mutex)SDL_UnlockMutex(ca_mutex);
+    snprintf(out,(size_t)size,"tls: %s  rng %s  first CA error: %s",
+             OpenSSL_version(OPENSSL_VERSION),RAND_status()==1?"ok":"NOT SEEDED",error);
+}
+
+static SDL_mutex *net_mutex;
+static SDL_cond *net_cond;
+/* Source searches spend seconds waiting for slow sites to answer with a
+   few dozen kilobytes, so several may run together; everything else waits
+   for them and runs alone. */
+#define NET_SOURCE_PARALLEL 3
+static int net_busy,net_busy_priority,net_paused,net_quit,net_priority_waiting,net_waiting;
+void net_background_acquire(int priority){
+    if(!net_mutex)return;
+    SDL_LockMutex(net_mutex);
+    net_waiting++;
+    if(priority)net_priority_waiting++;
+    while(!net_quit && (net_paused ||
+          (priority ? net_busy>net_busy_priority || net_busy_priority>=NET_SOURCE_PARALLEL
+                    : net_busy || net_priority_waiting)))
+        SDL_CondWait(net_cond,net_mutex);
+    if(priority){net_priority_waiting--;net_busy_priority++;}
+    net_waiting--;
+    net_busy++;
+    SDL_UnlockMutex(net_mutex);
+}
+void net_background_release(int priority){
+    if(!net_mutex)return;
+    SDL_LockMutex(net_mutex);
+    if(net_busy)net_busy--;
+    if(priority && net_busy_priority)net_busy_priority--;
+    SDL_CondBroadcast(net_cond);
+    SDL_UnlockMutex(net_mutex);
+}
+void net_background_pause(int paused){
+    if(!net_mutex)return;
+    SDL_LockMutex(net_mutex);
+    if(net_paused!=paused){net_paused=paused;SDL_CondBroadcast(net_cond);}
+    SDL_UnlockMutex(net_mutex);
+}
+void net_background_shutdown(void){
+    if(!net_mutex)return;
+    SDL_LockMutex(net_mutex);
+    net_quit=1;
+    SDL_CondBroadcast(net_cond);
+    SDL_UnlockMutex(net_mutex);
+}
+void net_background_stats(int *active,int *waiting){
+    *active=*waiting=0;
+    if(!net_mutex)return;
+    SDL_LockMutex(net_mutex);
+    *active=net_busy;*waiting=net_waiting;
+    SDL_UnlockMutex(net_mutex);
+}
+#else
+void net_background_acquire(int priority){(void)priority;}
+void net_background_release(int priority){(void)priority;}
+void net_background_pause(int paused){(void)paused;}
+void net_background_shutdown(void){}
+void net_background_stats(int *active,int *waiting){*active=*waiting=0;}
+void net_tls_options(void *handle){
+#ifdef UAPLAY_CA_BUNDLE
+    curl_easy_setopt((CURL *)handle,CURLOPT_CAINFO,UAPLAY_CA_BUNDLE);
+#else
+    (void)handle;
+#endif
+}
+void net_tls_stats(int *loaded,int *skipped,double *milliseconds){
+    *loaded=*skipped=0;*milliseconds=0;
+}
+void net_tls_info(char *out,int size){if(size>0)out[0]=0;}
+#endif
+
+#ifdef UAPLAY_CONSOLE
 static void country_cache_load(void){
     FILE *file=fopen(COUNTRY_CACHE_PATH,"r");
     if(!file)return;
@@ -78,31 +317,45 @@ static void country_cache_save(void){
 }
 void catalog_http_init(void) {
     catalog_ui_thread = SDL_ThreadID();
+#ifdef __vita__
+    ca_mutex=SDL_CreateMutex();
+    net_mutex=SDL_CreateMutex();
+    net_cond=SDL_CreateCond();
+    if(!net_mutex || !net_cond){
+        if(net_mutex)SDL_DestroyMutex(net_mutex);
+        if(net_cond)SDL_DestroyCond(net_cond);
+        net_mutex=NULL;net_cond=NULL;
+    }
+#endif
     country_cache_mutex=SDL_CreateMutex();
     country_cache_load();
 }
 void catalog_http_cleanup(void) {
     country_cache_save();
-    /* Slot 2 belongs to the detached source prefetch worker, which may
-       still be mid-request at exit. */
-    for (int i = 0; i < 2; i++) {
-        if (catalog_connections[i]) curl_easy_cleanup(catalog_connections[i]);
-        catalog_connections[i] = NULL;
-    }
+    /* Only the UI thread's handle: detached workers (source searches,
+       foreground jobs) may still be mid-request at exit. */
+    HttpThread *self = http_thread();
+    if (self && self->curl) { curl_easy_cleanup(self->curl); self->curl = NULL; }
     if(country_cache_mutex){SDL_DestroyMutex(country_cache_mutex);country_cache_mutex=NULL;}
 }
-static CURL **catalog_connection_slot(void) {
-    SDL_threadID self = SDL_ThreadID();
-    return &catalog_connections[self == catalog_ui_thread ? 0 :
-                                self == catalog_source_thread ? 2 : 1];
-}
 void catalog_http_bind_source_thread(void) {
-    catalog_source_thread = SDL_ThreadID();
+    HttpThread *self = http_thread();
+    if (self) self->role = 'S';
+}
+void catalog_http_bind_foreground_thread(void) {
+    HttpThread *self = http_thread();
+    if (self) self->role = 'U';
+}
+unsigned net_thread_request_count(void) {
+    HttpThread *self = http_thread();
+    return self ? self->requests : 0;
 }
 #else
 void catalog_http_init(void) { }
 void catalog_http_cleanup(void) { }
 void catalog_http_bind_source_thread(void) { }
+void catalog_http_bind_foreground_thread(void) { }
+unsigned net_thread_request_count(void) { return 0; }
 #endif
 
 static size_t on_data(char *ptr, size_t size, size_t count, void *opaque) {
@@ -147,9 +400,7 @@ static void request_options(CURL *curl, const char *url, Response *r,
     curl_easy_setopt(curl, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
     curl_easy_setopt(curl, CURLOPT_MAXCONNECTS, 4L);
 #endif
-#ifdef UAPLAY_CA_BUNDLE
-    curl_easy_setopt(curl, CURLOPT_CAINFO, UAPLAY_CA_BUNDLE);
-#endif
+    net_tls_options(curl);
 }
 
 static int transient_network_error(CURLcode result) {
@@ -167,9 +418,14 @@ static int transient_network_error(CURLcode result) {
 static char *request_form(const char *url, const char *post_data,
                           const char *referer, char *error, int error_size) {
 #ifdef UAPLAY_CONSOLE
-    CURL **slot = catalog_connection_slot();
+    /* Past HTTP_THREADS threads, fall back to a handle per request. */
+    HttpThread *thread = http_thread();
+    CURL *spare = NULL;
+    CURL **slot = thread ? &thread->curl : &spare;
     if (!*slot) *slot = curl_easy_init();
     CURL *curl = *slot;
+    char role = thread ? thread->role : 'C';
+    if (thread) thread->requests++;
 #else
     CURL *curl = curl_easy_init();
 #endif
@@ -190,6 +446,16 @@ static char *request_form(const char *url, const char *post_data,
         curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
         if(referer)curl_easy_setopt(curl,CURLOPT_REFERER,referer);
     }
+    char curl_error[CURL_ERROR_SIZE] = "";
+    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, curl_error);
+    char kind = 'U';
+    unsigned wait_started = net_ticks();
+#ifdef UAPLAY_CONSOLE
+    int background = role != 'U';
+    kind = role;
+    if (background) net_background_acquire(role == 'S');
+#endif
+    unsigned waited = net_ticks() - wait_started;
     CURLcode result = curl_easy_perform(curl);
     if (transient_network_error(result)) {
         /* A failed connection may poison a reused transport. Destroy that
@@ -203,6 +469,8 @@ static char *request_form(const char *url, const char *post_data,
 #endif
         if (curl) {
             request_options(curl, url, &r, post_data?3L:4L, post_data?5L:8L);
+            curl_error[0] = 0;
+            curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, curl_error);
             if(headers)curl_easy_setopt(curl,CURLOPT_HTTPHEADER,headers);
             if (post_data) {
                 curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data);
@@ -214,10 +482,15 @@ static char *request_form(const char *url, const char *post_data,
             result = curl_easy_perform(curl);
         } else result = CURLE_FAILED_INIT;
     }
+#ifdef UAPLAY_CONSOLE
+    if (background) net_background_release(role == 'S');
+#endif
+    net_profile_record(kind, curl, url, waited, (int)result, (unsigned)r.length,
+                       curl_error[0] ? curl_error : curl_easy_strerror(result));
     long status = 0;
     if (curl) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
 #ifdef UAPLAY_CONSOLE
-    if (result != CURLE_OK && curl) {
+    if ((result != CURLE_OK || slot == &spare) && curl) {
         curl_easy_cleanup(curl);
         *slot = NULL;
     }

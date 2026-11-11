@@ -3,6 +3,7 @@
 #include <string.h>
 #include <time.h>
 #include <math.h>
+#include <stdint.h>
 #include <sys/stat.h>
 #ifdef __vita__
 #include "../vita/vita_platform.h"
@@ -130,6 +131,7 @@ typedef struct {
     Movie items[CATALOG_PAGE_SIZE];
     int count;
     int state; /* 0 unknown, 1 queued, 2 loading, 3 ready */
+    char error[192];
 } HomeShelf;
 static HomeShelf home_shelves[HOME_SHELF_COUNT];
 static int home_shelf=0,home_cache_initialized=0,home_current_loaded=0;
@@ -299,6 +301,8 @@ static int catalog_worker(void *opaque){
                 home_shelves[shelf].count=count;
                 if(count>0)memcpy(home_shelves[shelf].items,batch,
                                   (size_t)count*sizeof(Movie));
+                snprintf(home_shelves[shelf].error,sizeof(home_shelves[shelf].error),
+                         "%s",error);
                 home_shelves[shelf].state=3;
             }
             SDL_UnlockMutex(loader->mutex);
@@ -381,12 +385,27 @@ static void catalog_home_prime(const Movie *movies,int count){
     if(loader->cond)SDL_CondSignal(loader->cond);
     SDL_UnlockMutex(loader->mutex);
 }
-static int catalog_home_copy(int shelf,Movie *movies){
+/* Queue every home shelf on the worker. At startup the first page
+   arrives while the interface already draws: on a first boot its country
+   checks alone can take a TMDB request per title. */
+static void catalog_home_start(void){
+    CatalogLoader *loader=&catalog_loader;
+    if(!loader->thread)return;
+    SDL_LockMutex(loader->mutex);
+    for(int i=0;i<HOME_SHELF_COUNT;i++)home_shelves[i].state=1;
+    home_cache_initialized=1;
+    home_current_loaded=0;
+    SDL_CondSignal(loader->cond);
+    SDL_UnlockMutex(loader->mutex);
+}
+/* Copies a loaded shelf (-1 while pending) and, if given, its load error. */
+static int catalog_home_copy(int shelf,Movie *movies,char *error,int error_size){
     CatalogLoader *loader=&catalog_loader;
     if(!loader->mutex || shelf<0 || shelf>=HOME_SHELF_COUNT)return -1;
     SDL_LockMutex(loader->mutex);
     int count=home_shelves[shelf].state==3?home_shelves[shelf].count:-1;
     if(count>0)memcpy(movies,home_shelves[shelf].items,(size_t)count*sizeof(Movie));
+    if(count>=0 && error)snprintf(error,(size_t)error_size,"%s",home_shelves[shelf].error);
     SDL_UnlockMutex(loader->mutex);
     return count;
 }
@@ -448,12 +467,20 @@ static void catalog_loader_poll(Movie **movies,int *count,int *capacity,int chos
         catalog_loading=0;
         catalog_has_more=more;
     }
+#ifdef __vita__
+    /* Weak Wi-Fi: each page also costs a TMDB country check per new film,
+       so keep only two pages loaded ahead of the cursor in every list. */
+    if(catalog_has_more && !catalog_loading && catalog_next_page<=500 &&
+       *count<limit && (*count<2*CATALOG_PAGE_SIZE || *count-chosen<=CATALOG_PAGE_SIZE))
+        catalog_loader_request(catalog_next_page++,category,query);
+#else
     /* Keep the initial 200-item background budget, then advance further only
        when the user scrolls toward the end of the expanded/search catalog. */
     if(catalog_has_more && !catalog_loading && catalog_next_page<=500 &&
        *count<limit && (*count<CATALOG_MAX ||
           ((expanded_catalog || (query && *query)) && *count-chosen<=42)))
         catalog_loader_request(catalog_next_page++,category,query);
+#endif
 }
 static void catalog_loader_shutdown(void){
     CatalogLoader *loader=&catalog_loader;
@@ -476,12 +503,12 @@ static int load_category(int category,const char *query,Movie *movies,char *mess
     previous_category=data_category;
     snprintf(previous_query,sizeof(previous_query),"%s",query);
     if(category==0 && !query[0] && home_cache_initialized){
-        int cached=catalog_home_copy(home_shelf,movies);
+        int cached=catalog_home_copy(home_shelf,movies,message,size);
         home_current_loaded=cached>=0;
         if(cached<0){
             snprintf(message,(size_t)size,"Завантаження добірки...");
             cached=0;
-        }else message[0]=0;
+        }
         catalog_loader_reset(data_category,query,cached,0);
         return cached;
     }
@@ -506,7 +533,6 @@ static int load_category(int category,const char *query,Movie *movies,char *mess
 }
 typedef struct {
     GLuint program, vbo, tex, solid_tex;
-    GLint tint, shape, gradient, outline, sampler;
     TTF_Font *font;
     TTF_Font *font_big;
     TTF_Font *font_small;
@@ -517,7 +543,134 @@ typedef struct {
     TTF_Font *scripts_tiny[7];
     TTF_Font *japanese[4];
     TTF_Font *symbols[4];
+    /* Fallback faces open on first use; these mark the attempted ones so
+       a missing file is not retried every frame. */
+    unsigned char scripts_tried[4][7],japanese_tried[4],symbols_tried[4];
 } Paint;
+/* Point sizes per slot: regular, small, big, tiny. */
+static const int font_sizes[]={22,19,31,15};
+static TTF_Font *open_fallback(TTF_Font **font,unsigned char *tried,
+                               const char *path,int size){
+    if(!*font && !*tried){*tried=1;*font=TTF_OpenFont(path,font_sizes[size]);}
+    return *font;
+}
+
+/* UI draw batch. Each glDrawArrays costs the Vita CPU far more than its
+   few triangles cost the GPU, so boxes, labels and posters are queued and
+   submitted together. Untextured boxes join any batch; a textured quad
+   flushes only when its texture differs from the batch's. Anything that
+   changes GL state or deletes a texture the queue may use calls ui_flush
+   first. */
+/* Frame profiler, toggled with Select+Start (F3 on a keyboard) or enabled
+   from launch by creating UAPLAY_DATA_DIR/profile.on. Shows an overlay and
+   writes one summary per second, every request and every source search to
+   UAPLAY_DATA_DIR/profile.log. */
+enum { PROF_INPUT, PROF_UPDATE, PROF_DRAW, PROF_FLUSH, PROF_VIDEO, PROF_SWAP,
+       PROF_SLEEP, PROF_OVERLAY, PROF_SECTIONS };
+static const char *prof_names[]={"input","update","draw","flush","video","swap",
+                                 "sleep","overlay"};
+#define PROF_LINES 26
+typedef struct {
+    int enabled;
+    FILE *log;
+    double ticks_per_ms;
+    Uint64 mark,frame_start;
+    double flush_debt;
+    double frame[PROF_SECTIONS],sum[PROF_SECTIONS],peak[PROF_SECTIONS];
+    double frame_sum,frame_peak;
+    int frames,frame_draw_calls,draw_calls,draw_peak,text_renders;
+    unsigned frame_vertices,vertices;
+    Uint32 window_at;
+    unsigned net_seen,source_seen,poster_count;
+    double poster_ms;
+    char lines[PROF_LINES][208],shown[PROF_LINES][208];
+    int line_count;
+    char startup[200];
+} Profiler;
+static Profiler prof;
+static Uint64 prof_now(void){return SDL_GetPerformanceCounter();}
+static double prof_ms(Uint64 from,Uint64 to){
+    return prof.ticks_per_ms>0?(double)(to-from)/prof.ticks_per_ms:0;
+}
+/* Charge the time since the previous mark to section. ui_flush time is
+   charged to PROF_FLUSH and taken out of the section it happened in. */
+static void prof_mark(int section){
+    if(!prof.enabled)return;
+    Uint64 now=prof_now();
+    double ms=prof_ms(prof.mark,now)-prof.flush_debt;
+    prof.frame[section]+=ms>0?ms:0;
+    prof.flush_debt=0;
+    prof.mark=now;
+}
+
+typedef struct {
+    float x,y;             /* clip space */
+    float u,v,lx,ly;       /* texture and 0..1 box-local coordinates */
+    float r,g,b,a;
+    float w,h,radius,outline;
+    float gradient,textured;
+} UiVertex;
+#define UI_BATCH_MAX 8192
+static UiVertex ui_batch[UI_BATCH_MAX];
+static int ui_batch_count;
+static GLuint ui_batch_texture;
+static Paint *ui_paint;
+static void ui_flush(void){
+    if(!ui_batch_count || !ui_paint)return;
+    Uint64 started=prof.enabled?prof_now():0;
+    prof.frame_draw_calls++;
+    prof.frame_vertices+=(unsigned)ui_batch_count;
+    Paint *p=ui_paint;
+    glUseProgram(p->program);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D,ui_batch_texture?ui_batch_texture:p->solid_tex);
+    glBindBuffer(GL_ARRAY_BUFFER,p->vbo);
+    glBufferData(GL_ARRAY_BUFFER,(GLsizeiptr)((size_t)ui_batch_count*sizeof(UiVertex)),
+                 ui_batch,GL_STREAM_DRAW);
+    static const int sizes[]={2,4,4,4,2},offsets[]={0,2,6,10,14};
+    for(int i=0;i<5;i++){
+        glEnableVertexAttribArray(i);
+        glVertexAttribPointer(i,sizes[i],GL_FLOAT,GL_FALSE,sizeof(UiVertex),
+                              (void*)(offsets[i]*sizeof(float)));
+    }
+    glDrawArrays(GL_TRIANGLES,0,ui_batch_count);
+    ui_batch_count=0;
+    ui_batch_texture=0;
+    if(prof.enabled){
+        double ms=prof_ms(started,prof_now());
+        prof.frame[PROF_FLUSH]+=ms;
+        prof.flush_debt+=ms;
+    }
+}
+/* Room for count vertices sampling texture (0 for untextured). */
+static UiVertex *ui_reserve(GLuint texture,int count){
+    if(ui_batch_count+count>UI_BATCH_MAX)ui_flush();
+    if(texture && ui_batch_texture && texture!=ui_batch_texture)ui_flush();
+    if(texture)ui_batch_texture=texture;
+    UiVertex *v=&ui_batch[ui_batch_count];
+    ui_batch_count+=count;
+    return v;
+}
+/* A flat vertex in 1280x720 units: solid colour, no rounding. */
+static void ui_flat_vertex(UiVertex *v,float x,float y,float r,float g,float b,float a){
+    *v=(UiVertex){x/640.f-1.f,1.f-y/360.f,.5f,.5f,.5f,.5f,r,g,b,a,
+                  100.f,100.f,0.f,0.f,0.f,0.f};
+}
+/* A box of w x h units at x,y showing texture region u0,v0..u1,v1. */
+static void ui_quad(GLuint texture,float x,float y,float w,float h,
+                    float u0,float v0,float u1,float v1,
+                    float r,float g,float b,float a,
+                    float radius,float outline,float gradient){
+    UiVertex *v=ui_reserve(texture,6);
+    float x0=x/640.f-1.f,x1=(x+w)/640.f-1.f;
+    float y0=1.f-y/360.f,y1=1.f-(y+h)/360.f;
+    const float corner[6][2]={{0,0},{1,0},{0,1},{1,0},{1,1},{0,1}};
+    for(int i=0;i<6;i++){
+        float cx=corner[i][0],cy=corner[i][1];
+        v[i]=(UiVertex){cx?x1:x0,cy?y1:y0,cx?u1:u0,cy?v1:v0,cx,cy,
+                        r,g,b,a,w,h,radius,outline,gradient,texture?1.f:0.f};
+    }
+}
 static const char *script_fonts[]={"Tamil","Telugu","Devanagari","Malayalam",
                                   "Bengali","Arabic","Thai"};
 static TTF_Font *choose_font(Paint *p,const char *s){
@@ -535,34 +688,50 @@ static TTF_Font *choose_font(Paint *p,const char *s){
                 cp>=0x0980 && cp<=0x09FF?4:
                 cp>=0x0600 && cp<=0x06FF?5:
                 cp>=0x0E00 && cp<=0x0E7F?6:-1;
+        if(cp<0x0600)continue;
+        int size=p->font==p->font_big?2:p->font==p->font_small?1:
+                 p->font==p->font_tiny?3:0;
         if(cp>=0x3040 && cp<=0x30ff || cp>=0x3400 && cp<=0x9fff ||
            cp>=0xff00 && cp<=0xffef){
-            int size=p->font==p->font_big?2:p->font==p->font_small?1:
-                     p->font==p->font_tiny?3:0;
-            if(p->japanese[size])return p->japanese[size];
+            if(open_fallback(&p->japanese[size],&p->japanese_tried[size],
+                             UAPLAY_ROMFS "NotoSansCJKjp-Regular.otf",size))
+                return p->japanese[size];
         }
         /* PlayStation button shapes are absent from Inter. */
         if(cp>=0x25A0 && cp<=0x27BF){
-            int size=p->font==p->font_big?2:p->font==p->font_small?1:
-                     p->font==p->font_tiny?3:0;
-            if(p->symbols[size])return p->symbols[size];
+            if(open_fallback(&p->symbols[size],&p->symbols_tried[size],
+                             UAPLAY_ROMFS "DejaVuSans.ttf",size))
+                return p->symbols[size];
         }
         if(idx>=0){
-            TTF_Font *fallback=p->font==p->font_big?p->scripts_big[idx]:
-                p->font==p->font_small?p->scripts_small[idx]:
-                p->font==p->font_tiny?p->scripts_tiny[idx]:p->scripts[idx];
+            TTF_Font **slots[]={p->scripts,p->scripts_small,p->scripts_big,p->scripts_tiny};
+            char path[96];
+            snprintf(path,sizeof(path),UAPLAY_ROMFS "NotoSans%s.ttf",script_fonts[idx]);
+            TTF_Font *fallback=open_fallback(&slots[size][idx],&p->scripts_tried[size][idx],
+                                             path,size);
             if(fallback)return fallback;
         }
     }
     return p->font;
 }
 
-static const char *vs = "attribute vec2 pos;attribute vec2 uv;varying vec2 tc;"
-                        "void main(){gl_Position=vec4(pos,0.,1.);tc=uv;}";
-static const char *fs = "precision mediump float;varying vec2 tc;"
-                        "uniform vec4 tint;uniform sampler2D image;uniform vec3 shape;"
-                        "uniform float gradient;uniform float outline;"
-                        "void main(){vec2 p=tc*shape.xy;vec2 q=abs(p-shape.xy*.5)"
+/* Everything a box needs travels with its vertices (texture and local
+   coordinates, tint, size/radius/outline, gradient/textured), so whole
+   runs of boxes and labels go to the GPU in one draw call. */
+static const char *vs = "attribute vec2 pos;attribute vec4 coord;attribute vec4 color;"
+                        "attribute vec4 box;attribute vec2 mode;"
+                        "varying vec4 tc;varying vec4 tint;varying vec4 shape;varying vec2 fill;"
+                        "void main(){gl_Position=vec4(pos,0.,1.);tc=coord;tint=color;"
+                        "shape=box;fill=mode;}";
+static const char *fs = "precision mediump float;varying vec4 tc;varying vec4 tint;"
+                        "varying vec4 shape;varying vec2 fill;uniform sampler2D image;"
+                        "void main(){float gradient=fill.x,outline=shape.w;"
+                        "vec4 texel=mix(vec4(1.0),texture2D(image,tc.xy),fill.y);"
+                        /* Text, posters, ribbons and the wallpaper copy need
+                           no distance field: skip it (most of the fill). */
+                        "if(shape.z<=0.0 && outline<=0.0 && gradient<0.5){"
+                        "gl_FragColor=texel*tint;}else{"
+                        "vec2 p=tc.zw*shape.xy;vec2 q=abs(p-shape.xy*.5)"
                         "-shape.xy*.5+shape.z;float d=length(max(q,0.0))"
                         "+min(max(q.x,q.y),0.0)-shape.z;"
                         "float a=1.0-smoothstep(-.7,.9,d);"
@@ -571,7 +740,7 @@ static const char *fs = "precision mediump float;varying vec2 tc;"
                         "vec3 rgb=tint.rgb;"
                         /* PS Vita wallpapers: dark indigo to ocean blue, or
                            the pale sky of the light theme, lit diagonally. */
-                        "float sky=tc.y*.78+tc.x*.22;"
+                        "float sky=tc.w*.78+tc.z*.22;"
                         "if(gradient>3.5)rgb=mix(vec3(.86,.92,.99),"
                         "vec3(.58,.74,.93),sky);"
                         "else if(gradient>2.5)rgb=mix(vec3(.016,.043,.137),"
@@ -580,10 +749,10 @@ static const char *fs = "precision mediump float;varying vec2 tc;"
                         /* Switch Basic White / Basic Black: gently shaded,
                            neutral surfaces rather than blue-black or beige. */
                         "if(gradient>1.5)rgb=mix(vec3(.957,.960,.965),"
-                        "vec3(.902,.907,.914),tc.y);"
+                        "vec3(.902,.907,.914),tc.w);"
                         "else if(gradient>.5)rgb=mix(vec3(.205,.208,.213),"
-                        "vec3(.135,.139,.145),tc.y);"
-                        "gl_FragColor=texture2D(image,tc)*vec4(rgb,tint.a)*a;}";
+                        "vec3(.135,.139,.145),tc.w);"
+                        "gl_FragColor=texel*vec4(rgb,tint.a)*a;}}";
 static void *proc(void *ctx, const char *name) {
     (void)ctx; return SDL_GL_GetProcAddress(name);
 }
@@ -600,7 +769,10 @@ static int paint_init(Paint *p) {
     p->program=glCreateProgram();
     glAttachShader(p->program,vert); glAttachShader(p->program,frag);
     glBindAttribLocation(p->program,0,"pos");
-    glBindAttribLocation(p->program,1,"uv");
+    glBindAttribLocation(p->program,1,"coord");
+    glBindAttribLocation(p->program,2,"color");
+    glBindAttribLocation(p->program,3,"box");
+    glBindAttribLocation(p->program,4,"mode");
     glLinkProgram(p->program);
     glDeleteShader(vert); glDeleteShader(frag);
     GLint linked=0;
@@ -611,14 +783,10 @@ static int paint_init(Paint *p) {
         fprintf(stderr,"UAPlay: UI shader link failed: %s\n",log);
         return 0;
     }
-    p->tint=glGetUniformLocation(p->program,"tint");
-    p->shape=glGetUniformLocation(p->program,"shape");
-    p->gradient=glGetUniformLocation(p->program,"gradient");
-    p->outline=glGetUniformLocation(p->program,"outline");
-    p->sampler=glGetUniformLocation(p->program,"image");
     glUseProgram(p->program);
-    glUniform1i(p->sampler,0);
+    glUniform1i(glGetUniformLocation(p->program,"image"),0);
     glGenBuffers(1,&p->vbo);
+    ui_paint=p;
     glGenTextures(1,&p->tex);
     p->solid_tex=p->tex;
     glBindTexture(GL_TEXTURE_2D,p->tex);
@@ -634,28 +802,14 @@ static int paint_init(Paint *p) {
     p->font_big=TTF_OpenFont(UAPLAY_ROMFS "InterVariable.ttf",31);
     p->font_small=TTF_OpenFont(UAPLAY_ROMFS "InterVariable.ttf",19);
     p->font_tiny=TTF_OpenFont(UAPLAY_ROMFS "InterVariable.ttf",15);
-    for(int i=0;i<7;i++){
-        char path[96];snprintf(path,sizeof(path),UAPLAY_ROMFS "NotoSans%s.ttf",script_fonts[i]);
-        p->scripts[i]=TTF_OpenFont(path,22);
-        p->scripts_small[i]=TTF_OpenFont(path,19);
-        p->scripts_big[i]=TTF_OpenFont(path,31);
-        p->scripts_tiny[i]=TTF_OpenFont(path,15);
-    }
-    const int jp_sizes[]={22,19,31,15};
-    for(int i=0;i<4;i++)
-        p->japanese[i]=TTF_OpenFont(UAPLAY_ROMFS "NotoSansCJKjp-Regular.otf",jp_sizes[i]);
-    for(int i=0;i<4;i++)
-        p->symbols[i]=TTF_OpenFont(UAPLAY_ROMFS "DejaVuSans.ttf",jp_sizes[i]);
+    /* Script, Japanese and symbol fallbacks open lazily in choose_font:
+       opening all 36 faces up front slowed startup, mostly for scripts
+       that a session never shows. */
     if(!p->font)fprintf(stderr,"UAPlay: cannot open UI font: %s\n",TTF_GetError());
     return p->font != NULL;
 }
 static int ui_outline_width=0;
 static void box_alpha(Paint *p,int x,int y,int w,int h,float r,float g,float b,float a,int radius) {
-    float x0=x/640.f-1.f,x1=(x+w)/640.f-1.f;
-    float y0=1.f-y/360.f,y1=1.f-(y+h)/360.f;
-    float vertices[]={x0,y0,0,0, x1,y0,1,0, x0,y1,0,1,
-                      x1,y0,1,0, x1,y1,1,1, x0,y1,0,1};
-    glUseProgram(p->program);
     /* Neutral Switch-inspired surfaces. Distinctly colored accents and
        bright buttons keep their original colors. This runs only for flat UI
        rectangles, never movie posters, textures or video overlays. */
@@ -684,29 +838,17 @@ static void box_alpha(Paint *p,int x,int y,int w,int h,float r,float g,float b,f
 #ifdef __vita__
     if(ui_gradient_pass)gradient_mode+=2.f;   /* wallpaper variants */
 #endif
-    glUniform4f(p->tint,r,g,b,a);
-    glUniform3f(p->shape,(float)w,(float)h,(float)radius);
-    glUniform1f(p->gradient,gradient_mode);
-    glUniform1f(p->outline,(float)ui_outline_width);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D,p->tex);
-    glBindBuffer(GL_ARRAY_BUFFER,p->vbo);
-    glBufferData(GL_ARRAY_BUFFER,sizeof(vertices),vertices,GL_STREAM_DRAW);
-    glEnableVertexAttribArray(0);glEnableVertexAttribArray(1);
-    glVertexAttribPointer(0,2,GL_FLOAT,GL_FALSE,4*sizeof(float),(void*)0);
-    glVertexAttribPointer(1,2,GL_FLOAT,GL_FALSE,4*sizeof(float),(void*)(2*sizeof(float)));
-    glDrawArrays(GL_TRIANGLES,0,6);
+    GLuint texture=p->tex==p->solid_tex?0:p->tex;
+    ui_quad(texture,(float)x,(float)y,(float)w,(float)h,0.f,0.f,1.f,1.f,
+            r,g,b,a,(float)radius,(float)ui_outline_width,gradient_mode);
     /* Nintendo Switch Basic White: a restrained 1px graphite outline for
        buttons, input fields and panels. Avoid icons, full-screen fills,
-       posters and the separate turquoise focus ring. Reuse this geometry
-       instead of allocating another texture or buffer. */
+       posters and the separate turquoise focus ring. */
     if(ui_theme_enabled && ui_light_theme && p->tex==p->solid_tex &&
        !ui_gradient_pass && !ui_outline_width &&
-       radius>=10 && w>=52 && h>=38){
-        glUniform1f(p->outline,1.2f);
-        glUniform4f(p->tint,.27f,.28f,.30f,.46f);
-        glDrawArrays(GL_TRIANGLES,0,6);
-    }
+       radius>=10 && w>=52 && h>=38)
+        ui_quad(0,(float)x,(float)y,(float)w,(float)h,0.f,0.f,1.f,1.f,
+                .27f,.28f,.30f,.46f,(float)radius,1.2f,0.f);
 }
 static void box(Paint *p,int x,int y,int w,int h,float r,float g,float b) {
     box_alpha(p,x,y,w,h,r,g,b,1.f,w>100 && h>40?14:5);
@@ -720,6 +862,7 @@ static void box(Paint *p,int x,int y,int w,int h,float r,float g,float b) {
 typedef struct {
     char *label;
     TTF_Font *font;
+    unsigned hash;
     GLuint texture;
     int width,height;
     size_t bytes;
@@ -728,10 +871,17 @@ typedef struct {
 static TextTexture text_cache[TEXT_CACHE_ENTRIES];
 static size_t text_cache_bytes;
 static unsigned long long text_cache_clock;
+/* FNV-1a: lookups run for every label on every frame, so compare a hash
+   before the strings. */
+static unsigned text_hash(const char *s){
+    unsigned h=2166136261u;
+    while(*s)h=(h^(unsigned char)*s++)*16777619u;
+    return h;
+}
 
 static void text_cache_release(int slot){
     TextTexture *entry=&text_cache[slot];
-    if(entry->texture)glDeleteTextures(1,&entry->texture);
+    if(entry->texture){ui_flush();glDeleteTextures(1,&entry->texture);}
     free(entry->label);
     if(entry->bytes<=text_cache_bytes)text_cache_bytes-=entry->bytes;
     memset(entry,0,sizeof(*entry));
@@ -780,9 +930,11 @@ static void text_color(Paint *p,const char *str,int x,int y,int limit,
     TTF_Font *font=choose_font(p,str);
     if(!font)return;
     TextTexture *found=NULL;
+    unsigned hash=text_hash(str);
     for(int i=0;i<TEXT_CACHE_ENTRIES;i++){
         TextTexture *entry=&text_cache[i];
-        if(entry->font==font && entry->label && !strcmp(entry->label,str)){
+        if(entry->hash==hash && entry->font==font && entry->label &&
+           !strcmp(entry->label,str)){
             found=entry;break;
         }
     }
@@ -792,6 +944,7 @@ static void text_color(Paint *p,const char *str,int x,int y,int limit,
         found->stamp=++text_cache_clock;
         width=found->width;height=found->height;
     }else{
+        prof.text_renders++;
         SDL_Color color={255,255,255,255};
         SDL_Surface *surface=TTF_RenderUTF8_Blended(font,str,color);
         if(!surface)return;
@@ -814,7 +967,7 @@ static void text_color(Paint *p,const char *str,int x,int y,int limit,
                 TextTexture *entry=&text_cache[slot];
                 entry->texture=create_glyph_texture(rgba);
                 if(entry->texture){
-                    entry->label=copy;entry->font=font;
+                    entry->label=copy;entry->font=font;entry->hash=hash;
                     entry->width=width;entry->height=height;
                     entry->bytes=bytes;entry->stamp=++text_cache_clock;
                     text_cache_bytes+=bytes;
@@ -827,17 +980,14 @@ static void text_color(Paint *p,const char *str,int x,int y,int limit,
     }
     GLuint texture=found?found->texture:transient_texture;
     if(!texture)return;
-    GLuint previous=p->tex;p->tex=texture;
-    /* Never shrink a long title: clip it at the card edge instead. */
-    if(limit>0){
-        glEnable(GL_SCISSOR_TEST);
-        glScissor(x*SCREEN_W/1280,(720-y-height)*SCREEN_H/720,
-                  (limit*SCREEN_W+1279)/1280,(height*SCREEN_H+719)/720);
-    }
-    box_alpha(p,x,y,width,height,r,g,b,1.f,0);
-    if(limit>0)glDisable(GL_SCISSOR_TEST);
-    p->tex=previous;
-    if(transient_texture)glDeleteTextures(1,&transient_texture);
+    /* Never shrink a long title: clip it at the card edge instead. The
+       quad itself is cut, so labels stay in the batch (a scissor change
+       would force a draw call per clipped label). */
+    float shown=(float)width,u1=1.f;
+    if(limit>0 && limit<width){shown=(float)limit;u1=(float)limit/(float)width;}
+    ui_quad(texture,(float)x,(float)y,shown,(float)height,0.f,0.f,u1,1.f,
+            r,g,b,1.f,0.f,(float)ui_outline_width,0.f);
+    if(transient_texture){ui_flush();glDeleteTextures(1,&transient_texture);}
 }
 static void text(Paint *p,const char *str,int x,int y,int limit){
     text_color(p,str,x,y,limit,1,1,1);
@@ -867,19 +1017,40 @@ static void text_muted(Paint *p,const char *s,int x,int y,int limit){
 static void text_tiny(Paint *p,const char *s,int x,int y,int limit){
     text_font(p,s,x,y,limit,p->font_tiny,.78f,.83f,.88f);
 }
+/* TTF_SizeUTF8 shapes the whole string with HarfBuzz, ~2 ms per call on
+   the Vita, and word wrapping measures every growing line on every frame.
+   The same strings come back each frame, so remember their sizes. */
+#define MEASURE_CACHE_ENTRIES 1024
+typedef struct { TTF_Font *font; unsigned hash; char *text; int w,h; } MeasuredText;
+static MeasuredText measure_cache[MEASURE_CACHE_ENTRIES];
+static void measure_size(TTF_Font *font,const char *s,int *w,int *h){
+    *w=*h=0;
+    if(!font)return;
+    unsigned hash=text_hash(s);
+    MeasuredText *entry=&measure_cache[(hash^(unsigned)(uintptr_t)font)%MEASURE_CACHE_ENTRIES];
+    if(entry->text && entry->font==font && entry->hash==hash && !strcmp(entry->text,s)){
+        *w=entry->w;*h=entry->h;
+        return;
+    }
+    TTF_SizeUTF8(font,s,w,h);
+    char *copy=malloc(strlen(s)+1);
+    if(!copy)return;
+    strcpy(copy,s);
+    free(entry->text);
+    *entry=(MeasuredText){font,hash,copy,*w,*h};
+}
 static int measure(Paint *p,const char *s,TTF_Font *font){
     TTF_Font *prev=p->font;p->font=font;
     int w=0,h=0;
-    TTF_SizeUTF8(choose_font(p,s),s,&w,&h);
+    measure_size(choose_font(p,s),s,&w,&h);
     p->font=prev;
     return w;
 }
 static int text_height(Paint *p,const char *s,TTF_Font *font){
     TTF_Font *previous=p->font;
     p->font=font;
-    TTF_Font *actual=choose_font(p,s);
     int w=0,h=0;
-    if(actual)TTF_SizeUTF8(actual,s,&w,&h);
+    measure_size(choose_font(p,s),s,&w,&h);
     p->font=previous;
     return h;
 }
@@ -1001,33 +1172,20 @@ static void button(Paint *p,const char *label,int x,int y,int w,int h,int primar
 }
 /* Solid vector polygons for crisp icons, independent of font glyph support. */
 static void polygon(Paint *p,const float *points,int count,float r,float g,float b){
+    (void)p;
     if(count<3 || count>60)return;
-    float vertices[(60+2)*4];
     float cx=0,cy=0;
     for(int i=0;i<count;i++){cx+=points[2*i];cy+=points[2*i+1];}
     cx/=count;cy/=count;
-    vertices[0]=cx/640.f-1.f;vertices[1]=1.f-cy/360.f;
-    vertices[2]=vertices[3]=.5f;
-    for(int i=0;i<=count;i++){
-        int j=i%count;
-        vertices[(i+1)*4]=points[j*2]/640.f-1.f;
-        vertices[(i+1)*4+1]=1.f-points[j*2+1]/360.f;
-        vertices[(i+1)*4+2]=vertices[(i+1)*4+3]=.5f;
-    }
     if(ui_theme_enabled && ui_light_theme){r=1.f-r;g=1.f-g;b=1.f-b;}
-    glUseProgram(p->program);
-    glUniform4f(p->tint,r,g,b,1.f);
-    glUniform3f(p->shape,100.f,100.f,0.f);
-    glUniform1f(p->gradient,0.f);
-    glUniform1f(p->outline,0.f);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D,p->solid_tex);
-    glBindBuffer(GL_ARRAY_BUFFER,p->vbo);
-    glBufferData(GL_ARRAY_BUFFER,(count+2)*4*sizeof(float),vertices,GL_STREAM_DRAW);
-    glEnableVertexAttribArray(0);glEnableVertexAttribArray(1);
-    glVertexAttribPointer(0,2,GL_FLOAT,GL_FALSE,4*sizeof(float),(void*)0);
-    glVertexAttribPointer(1,2,GL_FLOAT,GL_FALSE,4*sizeof(float),(void*)(2*sizeof(float)));
-    glDrawArrays(GL_TRIANGLE_FAN,0,count+2);
+    /* A fan around the centroid, as separate triangles for the batch. */
+    UiVertex *v=ui_reserve(0,count*3);
+    for(int i=0;i<count;i++){
+        int j=(i+1)%count;
+        ui_flat_vertex(&v[i*3],cx,cy,r,g,b,1.f);
+        ui_flat_vertex(&v[i*3+1],points[i*2],points[i*2+1],r,g,b,1.f);
+        ui_flat_vertex(&v[i*3+2],points[j*2],points[j*2+1],r,g,b,1.f);
+    }
 }
 static void search_icon(Paint *p,int cx,int cy,float bg_r,float bg_g,float bg_b){
     const float fg=.96f;
@@ -1058,35 +1216,25 @@ static void gear_icon(Paint *p,int cx,int cy,float bg_r,float bg_g,float bg_b){
    flat-filled; the soft edge comes from stacking wider, fainter layers. */
 #define RIBBON_STEP 20
 #define RIBBON_POINTS (1320/RIBBON_STEP+2)
-static void vita_ribbon(Paint *p,const float *centre,float half,float a){
-    float vertices[RIBBON_POINTS*2*4];
-    for(int i=0;i<RIBBON_POINTS;i++){
-        float x=(float)(-20+i*RIBBON_STEP)/640.f-1.f;
-        float *v=&vertices[i*8];
-        v[0]=x;v[1]=1.f-(centre[i]-half)/360.f;v[2]=v[3]=.5f;
-        v[4]=x;v[5]=1.f-(centre[i]+half)/360.f;v[6]=v[7]=.5f;
+static void vita_ribbon(const float *centre,float half,float a){
+    UiVertex *v=ui_reserve(0,(RIBBON_POINTS-1)*6);
+    for(int i=0;i+1<RIBBON_POINTS;i++){
+        float x0=(float)(-20+i*RIBBON_STEP),x1=x0+RIBBON_STEP;
+        UiVertex *q=&v[i*6];
+        ui_flat_vertex(&q[0],x0,centre[i]-half,1.f,1.f,1.f,a);
+        ui_flat_vertex(&q[1],x0,centre[i]+half,1.f,1.f,1.f,a);
+        ui_flat_vertex(&q[2],x1,centre[i+1]-half,1.f,1.f,1.f,a);
+        q[3]=q[2];q[4]=q[1];
+        ui_flat_vertex(&q[5],x1,centre[i+1]+half,1.f,1.f,1.f,a);
     }
-    glUseProgram(p->program);
-    glUniform4f(p->tint,1.f,1.f,1.f,a);
-    glUniform3f(p->shape,100.f,100.f,0.f);
-    glUniform1f(p->gradient,0.f);
-    glUniform1f(p->outline,0.f);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D,p->solid_tex);
-    glBindBuffer(GL_ARRAY_BUFFER,p->vbo);
-    glBufferData(GL_ARRAY_BUFFER,sizeof(vertices),vertices,GL_STREAM_DRAW);
-    glEnableVertexAttribArray(0);glEnableVertexAttribArray(1);
-    glVertexAttribPointer(0,2,GL_FLOAT,GL_FALSE,4*sizeof(float),(void*)0);
-    glVertexAttribPointer(1,2,GL_FLOAT,GL_FALSE,4*sizeof(float),(void*)(2*sizeof(float)));
-    glDrawArrays(GL_TRIANGLE_STRIP,0,RIBBON_POINTS*2);
 }
 /* PS Vita home-screen look: a lit gradient with slowly drifting ribbons of
    light, each a few layered strips so its edges fade out smoothly. */
-static void vita_wallpaper(Paint *p){
+static void vita_wallpaper_paint(Paint *p,Uint32 now){
     ui_gradient_pass=1;
     box_alpha(p,0,0,1280,720,0,0,0,1.f,0);
     ui_gradient_pass=0;
-    float t=SDL_GetTicks()*.00035f;
+    float t=now*.00035f;
     const float base[]={250,420,560},amp[]={46,60,38},freq[]={.0062f,.0047f,.0081f};
     const float thick[]={46,70,30},alpha[]={.022f,.016f,.026f},speed[]={1.f,-.7f,1.4f};
     const float layers[]={1.f,.82f,.64f,.47f,.31f,.16f};
@@ -1098,9 +1246,55 @@ static void vita_wallpaper(Paint *p){
                       +18.f*sinf(x*.013f-t*1.3f+k);
         }
         for(int l=0;l<6;l++)
-            vita_ribbon(p,centre,thick[k]*layers[l],
+            vita_ribbon(centre,thick[k]*layers[l],
                         ui_light_theme?alpha[k]*3.f:alpha[k]);
     }
+}
+/* The gradient and 18 blended ribbon strips cover the screen about 2.4
+   times with the rounded-box shader, which the Vita GPU cannot afford on
+   every frame. Paint them into a texture a few times a second (the
+   ribbons drift by about a pixel in between) and copy it each frame. */
+#define WALLPAPER_REFRESH_MS 66u
+static void vita_wallpaper(Paint *p){
+    static GLuint fbo,texture;
+    static int unavailable,painted_theme=-1;
+    static Uint32 painted_at;
+    Uint32 now=SDL_GetTicks();
+    ui_flush();
+    if(!fbo && !unavailable){
+        glGenTextures(1,&texture);
+        glBindTexture(GL_TEXTURE_2D,texture);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,SCREEN_W,SCREEN_H,0,
+                     GL_RGBA,GL_UNSIGNED_BYTE,NULL);
+        glGenFramebuffers(1,&fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER,fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D,texture,0);
+        if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE){
+            glBindFramebuffer(GL_FRAMEBUFFER,0);
+            glDeleteFramebuffers(1,&fbo);glDeleteTextures(1,&texture);
+            fbo=texture=0;unavailable=1;
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER,0);
+    }
+    if(unavailable){vita_wallpaper_paint(p,now);return;}
+    if(painted_theme!=ui_light_theme || now-painted_at>=WALLPAPER_REFRESH_MS){
+        glBindFramebuffer(GL_FRAMEBUFFER,fbo);
+        vita_wallpaper_paint(p,now);
+        ui_flush();
+        glBindFramebuffer(GL_FRAMEBUFFER,0);
+        painted_theme=ui_light_theme;painted_at=now;
+    }
+    /* Render targets are stored bottom-up, so sample with v flipped. */
+    glDisable(GL_BLEND);
+    ui_quad(texture,0.f,0.f,1280.f,720.f,0.f,1.f,1.f,0.f,
+            1.f,1.f,1.f,1.f,0.f,0.f,0.f);
+    ui_flush();
+    glEnable(GL_BLEND);
 }
 /* Vita status area: compact clock and a battery gauge, top right. */
 static void vita_status(Paint *p,int right,int y){
@@ -1302,49 +1496,85 @@ static void poster(Paint *p,const Movie *movie,int x,int y,int width,int height,
                            p->font_tiny,.98f,.96f,.88f);
     }
 }
-/* Source prefetch: as soon as a title's details open, one worker searches
-   every provider in turn, so the provider list can show only those with
-   results and opening one is instant. */
+/* Source prefetch: as soon as a title's details open, a few workers search
+   every provider, so the provider list can show only those with results
+   and opening one is instant. */
 #define PROVIDER_COUNT 7
 typedef struct {
     int done,count;
     Source items[UAKINO_MAX];
 } ProviderResult;
 static ProviderResult provider_results[PROVIDER_COUNT];
-static SDL_Thread *prefetch_thread;
 static SDL_mutex *prefetch_mutex;
 static SDL_cond *prefetch_cond;
 static Movie prefetch_movie;
-static int prefetch_generation,prefetch_pending,prefetch_has_movie;
+static int prefetch_generation,prefetch_has_movie;
+/* Several workers take providers from prefetch_next; the slowest sites go
+   first so the whole search lasts about as long as the slowest one. */
+#define PREFETCH_WORKERS 3
+static const int prefetch_order[PROVIDER_COUNT]={4,3,2,0,1,5,6};
+static int prefetch_next=PROVIDER_COUNT,prefetch_finished,prefetch_requests;
+static Uint32 prefetch_started_at;
+/* Per-provider search timings for the profiler; provider -1 is the whole
+   search for one title. */
+typedef struct { unsigned sequence; int provider,ms,requests,found; char title[48]; } SourceTiming;
+#define SOURCE_TIMINGS 16
+static SourceTiming source_timings[SOURCE_TIMINGS];
+static unsigned source_timing_sequence;
+static SDL_SpinLock source_timing_lock;
+static void source_timing_record(int provider,Uint32 ms,unsigned requests,int found,
+                                 const char *title){
+    SDL_AtomicLock(&source_timing_lock);
+    SourceTiming *t=&source_timings[++source_timing_sequence%SOURCE_TIMINGS];
+    t->sequence=source_timing_sequence;
+    t->provider=provider;t->ms=(int)ms;t->requests=(int)requests;t->found=found;
+    snprintf(t->title,sizeof(t->title),"%s",title);
+    SDL_AtomicUnlock(&source_timing_lock);
+}
+/* Timings newer than after, oldest first. */
+static int source_timing_since(unsigned after,SourceTiming *out,int max){
+    int count=0;
+    SDL_AtomicLock(&source_timing_lock);
+    unsigned last=source_timing_sequence;
+    unsigned first=last>SOURCE_TIMINGS?last-SOURCE_TIMINGS+1:1;
+    if(after+1>first)first=after+1;
+    if(last>=first && last-first+1>(unsigned)max)first=last-(unsigned)max+1;
+    for(unsigned i=first;i<=last;i++)out[count++]=source_timings[i%SOURCE_TIMINGS];
+    SDL_AtomicUnlock(&source_timing_lock);
+    return count;
+}
 static int prefetch_worker(void *opaque){
     (void)opaque;
     catalog_http_bind_source_thread();
-    static Source found[UAKINO_MAX];
+    Source *found=malloc(sizeof(Source)*UAKINO_MAX);
+    if(!found)return 0;
     for(;;){
         SDL_LockMutex(prefetch_mutex);
-        while(!prefetch_pending)SDL_CondWait(prefetch_cond,prefetch_mutex);
-        prefetch_pending=0;
+        while(prefetch_next>=PROVIDER_COUNT)SDL_CondWait(prefetch_cond,prefetch_mutex);
+        int provider=prefetch_order[prefetch_next++];
         Movie movie=prefetch_movie;
         int generation=prefetch_generation;
         SDL_UnlockMutex(prefetch_mutex);
-        for(int i=0;i<PROVIDER_COUNT;i++){
-            SDL_LockMutex(prefetch_mutex);
-            int stale=generation!=prefetch_generation;
-            SDL_UnlockMutex(prefetch_mutex);
-            if(stale)break;
-            char error[256];
-            int count=uakino_search_provider(&movie,found,UAKINO_MAX,i+1,
-                                             error,sizeof(error));
-            count=catalog_rank_sources(&movie,found,count,source_mode);
-            SDL_LockMutex(prefetch_mutex);
-            if(generation==prefetch_generation){
-                ProviderResult *r=&provider_results[i];
-                r->count=count;
-                memcpy(r->items,found,sizeof(Source)*(size_t)count);
-                r->done=1;
-            }
-            SDL_UnlockMutex(prefetch_mutex);
+        char error[256];
+        Uint32 started=SDL_GetTicks();
+        unsigned requests=net_thread_request_count();
+        int count=uakino_search_provider(&movie,found,UAKINO_MAX,provider+1,
+                                         error,sizeof(error));
+        count=catalog_rank_sources(&movie,found,count,source_mode);
+        requests=net_thread_request_count()-requests;
+        source_timing_record(provider,SDL_GetTicks()-started,requests,count,movie.title);
+        SDL_LockMutex(prefetch_mutex);
+        if(generation==prefetch_generation){
+            ProviderResult *r=&provider_results[provider];
+            r->count=count;
+            memcpy(r->items,found,sizeof(Source)*(size_t)count);
+            r->done=1;
+            prefetch_requests+=(int)requests;
+            if(++prefetch_finished==PROVIDER_COUNT)
+                source_timing_record(-1,SDL_GetTicks()-prefetch_started_at,
+                                     (unsigned)prefetch_requests,0,movie.title);
         }
+        SDL_UnlockMutex(prefetch_mutex);
     }
     return 0;
 }
@@ -1354,9 +1584,10 @@ static void sources_prefetch(const Movie *movie){
         prefetch_mutex=SDL_CreateMutex();
         prefetch_cond=SDL_CreateCond();
         if(!prefetch_mutex || !prefetch_cond)return;
-        prefetch_thread=SDL_CreateThread(prefetch_worker,"source-prefetch",NULL);
-        if(!prefetch_thread)return;
-        SDL_DetachThread(prefetch_thread);
+        for(int i=0;i<PREFETCH_WORKERS;i++){
+            SDL_Thread *thread=SDL_CreateThread(prefetch_worker,"source-prefetch",NULL);
+            if(thread)SDL_DetachThread(thread);
+        }
     }
     SDL_LockMutex(prefetch_mutex);
     if(!prefetch_has_movie || prefetch_movie.id!=movie->id ||
@@ -1364,12 +1595,108 @@ static void sources_prefetch(const Movie *movie){
         prefetch_movie=*movie;
         prefetch_has_movie=1;
         prefetch_generation++;
-        prefetch_pending=1;
+        prefetch_next=prefetch_finished=prefetch_requests=0;
+        prefetch_started_at=SDL_GetTicks();
         for(int i=0;i<PROVIDER_COUNT;i++)
             provider_results[i].done=provider_results[i].count=0;
-        SDL_CondSignal(prefetch_cond);
+        SDL_CondBroadcast(prefetch_cond);
     }
     SDL_UnlockMutex(prefetch_mutex);
+}
+/* Opening a source (its episode list, or the stream address) takes one or
+   two slow page loads. A worker does it so the interface keeps drawing;
+   the main loop applies the result if the user is still waiting for it. */
+typedef struct {
+    int episodes;        /* episode list (series) or 0 */
+    int resolved;        /* stream address found */
+    char url[2048],subtitle[1024],message[256];
+} OpenResult;
+static SDL_mutex *open_mutex;
+static SDL_cond *open_cond;
+static int open_requested,open_busy,open_ready,open_generation,open_job_generation;
+static Source open_source;
+static int open_series;
+static OpenResult open_result;
+static Episode open_episodes[EPISODES_MAX];
+static int open_worker(void *opaque){
+    (void)opaque;
+    catalog_http_bind_foreground_thread();
+    static OpenResult result;
+    for(;;){
+        SDL_LockMutex(open_mutex);
+        while(!open_requested)SDL_CondWait(open_cond,open_mutex);
+        open_requested=0;
+        Source source=open_source;
+        int series=open_series,generation=open_job_generation;
+        SDL_UnlockMutex(open_mutex);
+        memset(&result,0,sizeof(result));
+        if(series)
+            result.episodes=uakino_episodes(&source,open_episodes,EPISODES_MAX,
+                                            result.message,sizeof(result.message));
+        if(!result.episodes){
+            result.message[0]=0;
+            result.resolved=uakino_resolve(&source,result.url,sizeof(result.url),
+                                           result.message,sizeof(result.message));
+            if(result.resolved)
+                snprintf(result.subtitle,sizeof(result.subtitle),"%s",uakino_resolved_subtitle());
+        }
+        SDL_LockMutex(open_mutex);
+        open_result=result;
+        open_ready=generation;
+        open_busy=0;
+        SDL_UnlockMutex(open_mutex);
+    }
+    return 0;
+}
+/* Returns 0 while a previous open is still running. */
+static int open_start(const Source *source,int series){
+    if(!open_mutex){
+        open_mutex=SDL_CreateMutex();
+        open_cond=SDL_CreateCond();
+        if(!open_mutex || !open_cond)return 0;
+        SDL_Thread *thread=SDL_CreateThread(open_worker,"source-open",NULL);
+        if(!thread)return 0;
+        SDL_DetachThread(thread);
+    }
+    SDL_LockMutex(open_mutex);
+    int started=!open_busy;
+    if(started){
+        open_source=*source;
+        open_series=series;
+        open_job_generation=++open_generation;
+        open_busy=open_requested=1;
+        SDL_CondSignal(open_cond);
+    }
+    SDL_UnlockMutex(open_mutex);
+    return started;
+}
+/* Forget the running open; its result will be dropped. */
+static void open_cancel(void){
+    if(!open_mutex)return;
+    SDL_LockMutex(open_mutex);
+    open_generation++;
+    SDL_UnlockMutex(open_mutex);
+}
+static int open_pending(void){
+    if(!open_mutex)return 0;
+    SDL_LockMutex(open_mutex);
+    int pending=open_busy && open_job_generation==open_generation;
+    SDL_UnlockMutex(open_mutex);
+    return pending;
+}
+/* The finished open for the current request, with its episodes copied
+   into episodes[]. */
+static int open_poll(OpenResult *out){
+    if(!open_mutex)return 0;
+    SDL_LockMutex(open_mutex);
+    int ready=open_ready && open_ready==open_generation;
+    if(ready){
+        *out=open_result;
+        if(out->episodes)memcpy(episodes,open_episodes,sizeof(Episode)*(size_t)out->episodes);
+    }
+    open_ready=0;
+    SDL_UnlockMutex(open_mutex);
+    return ready;
 }
 /* Providers that returned results, in menu order. *searching is set while
    some providers have not answered yet. */
@@ -1824,11 +2151,12 @@ static void draw_player_controls(Paint *p,mpv_handle *player) {
     box_alpha(p,70+volume*178/130-7,641,14,20,.96f,.97f,.98f,1.f,7);
     char volume_label[24];snprintf(volume_label,sizeof(volume_label),"%d%%",volume);
     text_tiny(p,volume_label,122,672,100);
-    const int centers[]={354,476,598,832,954,1076};
-    const char *icons[]={"−10",paused?"▶":"Ⅱ","+10","","♪","CC"};
+    const int centers[]={354,476,598,832,954,1076,1198};
+    const char *icons[]={"−10",paused?"▶":"Ⅱ","+10","","♪","CC",""};
+    int fill=video_options[7]>.5;
     const char *labels[]={"10 с назад","Пауза / пуск","10 с вперед",
-                          "Параметри","Аудіо","Субтитри"};
-    for(int i=0;i<6;i++){
+                          "Параметри","Аудіо","Субтитри",scale_labels[fill]};
+    for(int i=0;i<7;i++){
         const int w=76;
         box_alpha(p,centers[i]-w/2,610,w,58,.18f,.22f,.26f,.94f,15);
         text_center(p,icons[i],centers[i]-w/2,624,w,
@@ -1836,6 +2164,15 @@ static void draw_player_controls(Paint *p,mpv_handle *player) {
         if(i==3)gear_icon(p,centers[i],639,.18f,.22f,.26f);
         text_center(p,labels[i],centers[i]-72,678,144,p->font_tiny,.78f,.84f,.89f);
     }
+    /* Scale: a screen frame with the picture inside it (fit) or spilling
+       past it (fill). */
+    int cx=centers[6],cy=639;
+    ui_outline_width=2;
+    box_alpha(p,cx-18,cy-12,36,24,.98f,.98f,.99f,1.f,4);
+    ui_outline_width=0;
+    if(fill)box_alpha(p,cx-24,cy-9,48,18,.98f,.98f,.99f,.85f,2);
+    else box_alpha(p,cx-12,cy-5,24,10,.98f,.98f,.99f,.85f,2);
+    text_tiny(p,"Start — масштаб",1090,519,170);
 }
 static void draw_next_episode_prompt(Paint *p,const Episode *next,int seconds){
     ui_theme_enabled=0;
@@ -1911,14 +2248,217 @@ static int keyboard(char *value,size_t size) {
     return R_SUCCEEDED(result) && value[0];
 #endif
 }
+static const char *prof_kind_name(char kind){
+    return kind=='U'?"ui":kind=='C'?"catalog":kind=='S'?"sources":"posters";
+}
+static void prof_format_request(char *out,size_t size,const NetSample *n){
+    char result[120]="";
+    if(n->result)snprintf(result,sizeof(result)," curl%d %s",n->result,n->error);
+    snprintf(out,size,"%-7s %-22.22s wait %4d dns %4d conn %4d tls %4d first %5d total %5d %4uK %3ld%s",
+             prof_kind_name(n->kind),n->host,n->wait,n->dns,n->connect,n->tls,
+             n->first_byte,n->total,n->bytes/1024u,n->status,result);
+}
+static void prof_format_source(char *out,size_t size,const SourceTiming *t){
+    if(t->provider<0)
+        snprintf(out,size,"sources: all providers %5d ms  %2d requests  \"%.40s\"",
+                 t->ms,t->requests,t->title);
+    else snprintf(out,size,"sources: %-16.16s %5d ms  %2d requests  %2d found",
+                  provider_names[t->provider],t->ms,t->requests,t->found);
+}
+static void prof_reset_window(void){
+    memset(prof.sum,0,sizeof(prof.sum));
+    memset(prof.peak,0,sizeof(prof.peak));
+    prof.frame_sum=prof.frame_peak=0;
+    prof.frames=prof.draw_calls=prof.draw_peak=prof.text_renders=0;
+    prof.vertices=0;
+    prof.window_at=SDL_GetTicks();
+    posters_upload_stats(&prof.poster_count,&prof.poster_ms);
+}
+/* Once a second: rebuild the overlay text and append to the log. */
+static void prof_summarize(void){
+    Uint32 elapsed=SDL_GetTicks()-prof.window_at;
+    int frames=prof.frames?prof.frames:1;
+    double fps=elapsed?prof.frames*1000.0/elapsed:0;
+    unsigned poster_count;double poster_ms;
+    posters_upload_stats(&poster_count,&poster_ms);
+    poster_count-=prof.poster_count;poster_ms-=prof.poster_ms;
+    int active,waiting;net_background_stats(&active,&waiting);
+    char platform[128]="";
+#ifdef __vita__
+    vita_profile_info(platform,sizeof(platform));
+#endif
+    int l=0;
+#define PROF_LINE(...) do{ if(l<PROF_LINES)snprintf(prof.lines[l++],sizeof(prof.lines[0]),__VA_ARGS__); }while(0)
+    PROF_LINE("FPS %.1f   frame avg %.1f ms  max %.1f ms   (Select+Start hides)",
+              fps,prof.frame_sum/frames,prof.frame_peak);
+    PROF_LINE("avg  input %.1f  update %.1f  draw %.1f  flush %.1f  video %.1f  swap %.1f  sleep %.1f",
+              prof.sum[PROF_INPUT]/frames,prof.sum[PROF_UPDATE]/frames,prof.sum[PROF_DRAW]/frames,
+              prof.sum[PROF_FLUSH]/frames,prof.sum[PROF_VIDEO]/frames,prof.sum[PROF_SWAP]/frames,
+              prof.sum[PROF_SLEEP]/frames);
+    PROF_LINE("max  input %.1f  update %.1f  draw %.1f  flush %.1f  video %.1f  swap %.1f",
+              prof.peak[PROF_INPUT],prof.peak[PROF_UPDATE],prof.peak[PROF_DRAW],
+              prof.peak[PROF_FLUSH],prof.peak[PROF_VIDEO],prof.peak[PROF_SWAP]);
+    PROF_LINE("draw calls %d/frame (max %d)  vertices %u/frame  new labels %d/s  posters %u/s %.1f ms",
+              prof.draw_calls/frames,prof.draw_peak,prof.vertices/(unsigned)frames,
+              prof.text_renders,poster_count,poster_ms);
+    if(platform[0])PROF_LINE("%s",platform);
+    int ca_loaded,ca_skipped;double ca_ms;
+    net_tls_stats(&ca_loaded,&ca_skipped,&ca_ms);
+    PROF_LINE("network: background active %d waiting %d   requests ui %u catalog %u sources %u posters %u"
+              "   CA %d certs (%d skipped) %.0f ms",
+              active,waiting,net_request_count('U'),net_request_count('C'),
+              net_request_count('S'),net_request_count('P'),ca_loaded,ca_skipped,ca_ms);
+    char tls[200];
+    net_tls_info(tls,sizeof(tls));
+    if(tls[0])PROF_LINE("%s",tls);
+    if(prof.startup[0])PROF_LINE("%s",prof.startup);
+#ifdef __vita__
+    char boot[160];
+    vita_boot_info(boot,sizeof(boot));
+    PROF_LINE("%s",boot);
+#endif
+    NetSample recent[7];
+    int recent_count=net_profile_since(0,recent,7);
+    for(int i=0;i<recent_count;i++){
+        char line[160];prof_format_request(line,sizeof(line),&recent[i]);
+        PROF_LINE("%s",line);
+    }
+    SourceTiming sources[8];
+    int source_count=source_timing_since(0,sources,8);
+    for(int i=0;i<source_count;i++){
+        char line[160];prof_format_source(line,sizeof(line),&sources[i]);
+        PROF_LINE("%s",line);
+    }
+#undef PROF_LINE
+    prof.line_count=l;
+    if(prof.log){
+        fprintf(prof.log,"T %.1fs fps %.1f frame %.1f/%.1f",
+                SDL_GetTicks()/1000.0,fps,prof.frame_sum/frames,prof.frame_peak);
+        for(int i=0;i<PROF_SECTIONS;i++)
+            fprintf(prof.log," %s %.1f/%.1f",prof_names[i],prof.sum[i]/frames,prof.peak[i]);
+        if(tls[0])fprintf(prof.log,"%s\n",tls);
+        fprintf(prof.log," calls %d/%d verts %u labels %d posters %u/%.1fms net %d/%d ca %d/%d/%.0fms %s\n",
+                prof.draw_calls/frames,prof.draw_peak,prof.vertices/(unsigned)frames,
+                prof.text_renders,poster_count,poster_ms,active,waiting,
+                ca_loaded,ca_skipped,ca_ms,platform);
+        static NetSample samples[128];
+        int count=net_profile_since(prof.net_seen,samples,128);
+        for(int i=0;i<count;i++){
+            char line[160];prof_format_request(line,sizeof(line),&samples[i]);
+            fprintf(prof.log,"NET %.1fs %s\n",samples[i].at/1000.0,line);
+            prof.net_seen=samples[i].sequence;
+        }
+        SourceTiming timings[SOURCE_TIMINGS];
+        count=source_timing_since(prof.source_seen,timings,SOURCE_TIMINGS);
+        for(int i=0;i<count;i++){
+            char line[160];prof_format_source(line,sizeof(line),&timings[i]);
+            fprintf(prof.log,"SRC %s\n",line);
+            prof.source_seen=timings[i].sequence;
+        }
+        fflush(prof.log);
+    }
+    prof_reset_window();
+}
+static void prof_toggle(void){
+    prof.enabled=!prof.enabled;
+    if(!prof.enabled){
+        if(prof.log){fclose(prof.log);prof.log=NULL;}
+        return;
+    }
+    prof.log=fopen(UAPLAY_DATA_DIR "/profile.log","w");
+    if(prof.log && prof.startup[0])fprintf(prof.log,"%s\n",prof.startup);
+    prof.net_seen=prof.source_seen=0;   /* also log what is still buffered */
+    prof.line_count=1;
+    snprintf(prof.lines[0],sizeof(prof.lines[0]),"Profiler: collecting...");
+    prof.mark=prof.frame_start=prof_now();
+    prof_reset_window();
+}
+static void prof_frame_begin(void){
+    prof.frame_draw_calls=0;
+    prof.frame_vertices=0;
+    if(!prof.enabled)return;
+    memset(prof.frame,0,sizeof(prof.frame));
+    prof.flush_debt=0;
+    prof.mark=prof.frame_start=prof_now();
+}
+static void prof_frame_end(void){
+    if(!prof.enabled)return;
+    /* The overlay's own cost stays out of the frame figures. */
+    double total=prof_ms(prof.frame_start,prof_now())-prof.frame[PROF_OVERLAY];
+    for(int i=0;i<PROF_SECTIONS;i++){
+        prof.sum[i]+=prof.frame[i];
+        if(prof.frame[i]>prof.peak[i])prof.peak[i]=prof.frame[i];
+    }
+    prof.frame_sum+=total;
+    if(total>prof.frame_peak)prof.frame_peak=total;
+    prof.frames++;
+    prof.draw_calls+=prof.frame_draw_calls;
+    if(prof.frame_draw_calls>prof.draw_peak)prof.draw_peak=prof.frame_draw_calls;
+    prof.vertices+=prof.frame_vertices;
+    if(SDL_GetTicks()-prof.window_at>=1000)prof_summarize();
+}
+/* Drawn last; its own time and labels are kept out of the frame figures. */
+static void prof_draw(Paint *p){
+    if(!prof.enabled || !prof.line_count)return;
+    prof_mark(PROF_UPDATE);
+    int labels=prof.text_renders,theme=ui_theme_enabled;
+    ui_theme_enabled=0;
+    box_alpha(p,6,6,1268,prof.line_count*19+12,0.f,0.f,0.f,.74f,8);
+    /* A long label takes tens of milliseconds to render on the Vita: adopt
+       at most two changed lines per frame instead of all at once. */
+    int updates=0;
+    for(int i=0;i<prof.line_count;i++){
+        if(strcmp(prof.shown[i],prof.lines[i]) && updates<2){
+            memcpy(prof.shown[i],prof.lines[i],sizeof(prof.shown[i]));
+            updates++;
+        }
+        text_font(p,prof.shown[i],14,12+i*19,1252,p->font_tiny,
+                  i==0?1.f:.86f,i==0?.92f:.93f,i==0?.35f:1.f);
+    }
+    ui_flush();
+    ui_theme_enabled=theme;
+    prof.text_renders=labels;
+    prof_mark(PROF_OVERLAY);
+}
+/* Startup steps in milliseconds, reported once the first frame is shown.
+   Loading the executable before main() is not included. */
+static Uint64 boot_mark;
+static double boot_steps[9];
+static void prof_boot_step(int step){
+    Uint64 now=prof_now();
+    boot_steps[step]=prof_ms(boot_mark,now);
+    boot_mark=now;
+}
+static void prof_boot_done(void){
+    double total=0;
+    for(int i=0;i<9;i++)total+=boot_steps[i];
+    snprintf(prof.startup,sizeof(prof.startup),
+             "startup ms: platform %.0f data %.0f net %.0f sdl %.0f ui %.0f posters %.0f "
+             "player %.0f catalog %.0f first frame %.0f = %.0f",
+             boot_steps[0],boot_steps[1],boot_steps[2],boot_steps[3],boot_steps[4],
+             boot_steps[5],boot_steps[6],boot_steps[7],boot_steps[8],total);
+    if(prof.log){
+        fprintf(prof.log,"%s\n",prof.startup);
+#ifdef __vita__
+        char boot[160];
+        vita_boot_info(boot,sizeof(boot));
+        fprintf(prof.log,"%s\n",boot);
+#endif
+        fflush(prof.log);
+    }
+}
 int main(void) {
+    prof.ticks_per_ms=(double)SDL_GetPerformanceFrequency()/1000.0;
+    boot_mark=prof_now();
 #ifdef __vita__
     if(!vita_platform_init())return 1;
 #else
     romfsInit();
 #endif
+    prof_boot_step(0);
     library_init();
     theme_load();
+    prof_boot_step(1);
 #ifdef __vita__
     int network_ready=vita_network_init();
 #else
@@ -1926,6 +2466,7 @@ int main(void) {
     int network_ready=R_SUCCEEDED(network_result);
 #endif
     if (network_ready) curl_global_init(CURL_GLOBAL_DEFAULT);
+    prof_boot_step(2);
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS,"1");
 #ifdef __vita__
     /* curl + OpenSSL handshakes overflow SDL's 64 KiB default thread stack. */
@@ -1936,6 +2477,11 @@ int main(void) {
         return 1;
     }
     catalog_http_init();
+    {
+        struct stat flag;
+        if(stat(UAPLAY_DATA_DIR "/profile.on",&flag)==0)prof_toggle();
+    }
+    prof_boot_step(3);
 #ifdef __vita__
     /* vitaGL owns the display; SDL only supplies input, fonts and images. */
     SDL_Window *window=NULL;
@@ -1950,7 +2496,10 @@ int main(void) {
 #endif
     Paint paint={0};
     if(!paint_init(&paint)) goto cleanup;
+    prof_boot_step(4);
     posters_init();
+    posters_set_flush(ui_flush);
+    prof_boot_step(5);
     SDL_GameController *pad=NULL;
     for(int i=0;i<SDL_NumJoysticks();i++)
         if(SDL_IsGameController(i)){pad=SDL_GameControllerOpen(i);break;}
@@ -1978,6 +2527,7 @@ int main(void) {
             mpv_render_context_create(&render,player,init);
         }
     }
+    prof_boot_step(6);
     int movie_capacity=CATALOG_LOCAL_MAX;
     Movie *movies=calloc((size_t)movie_capacity,sizeof(Movie));
     if(!movies)goto cleanup;
@@ -1988,7 +2538,10 @@ int main(void) {
     Page page=CATALOG;
     char query[192]={0},message[256]={0};
     catalog_loader_init();
+    catalog_home_start();
     n=load_category(category,query,movies,message,sizeof(message));
+    prof_boot_step(7);
+    int first_frame=1;
     Movie playing_movie={0};
     double resume_at=0;
     char pending_subtitle[1024]={0};
@@ -2007,6 +2560,7 @@ int main(void) {
 #endif
     while(running){
         Uint32 frame_started_at=SDL_GetTicks();
+        prof_frame_begin();
         stick_arrow(pad,&stick_last_time,&stick_last_key);
 #ifdef __vita__
         vita_poll_touch();
@@ -2030,6 +2584,12 @@ int main(void) {
                     case SDLK_m:key=SDL_CONTROLLER_BUTTON_BACK;break;
                     case SDLK_ESCAPE:key=SDL_CONTROLLER_BUTTON_START;break;
                 }
+            }
+            if((e.type==SDL_KEYDOWN && e.key.keysym.sym==SDLK_F3) ||
+               (key==SDL_CONTROLLER_BUTTON_START && pad &&
+                SDL_GameControllerGetButton(pad,SDL_CONTROLLER_BUTTON_BACK))){
+                prof_toggle();
+                continue;
             }
             int tx=-1,ty=-1;
             if(e.type==SDL_FINGERDOWN ||
@@ -2091,6 +2651,7 @@ int main(void) {
                         else if(tx>=785 && tx<879)key=SDL_CONTROLLER_BUTTON_BACK;
                         else if(tx>=907 && tx<1001)key=SDL_CONTROLLER_BUTTON_Y;
                         else if(tx>=1029 && tx<1123)key=SDL_CONTROLLER_BUTTON_X;
+                        else if(tx>=1151 && tx<1245)key=SDL_CONTROLLER_BUTTON_START;
                     }else continue;
                 }else if(page==CATALOG){
                     if(ty<78 && tx>=193 && tx<742){
@@ -2311,6 +2872,11 @@ int main(void) {
                     next_episode_request=catalog_next_episode(
                         episodes,episode_count,active_episode_variant);
                 if(key==SDL_CONTROLLER_BUTTON_A)command(player,"cycle","pause");
+                /* Start switches fit / fill (mpv panscan), as in video settings. */
+                if(key==SDL_CONTROLLER_BUTTON_START){
+                    video_options[7]=video_options[7]>.5?0.0:1.0;
+                    playback_set_value(player,video_props[7],video_options[7]);
+                }
                 int fast=pad && SDL_GameControllerGetAttached(pad) &&
                     SDL_GameControllerGetButton(pad,SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
                 if(key==SDL_CONTROLLER_BUTTON_DPAD_LEFT)seek(player,fast?"-60":"-10");
@@ -2807,47 +3373,54 @@ int main(void) {
                     source=0;page=SOURCES;
                 }
             }else if(page==SOURCES){
-                if(key==SDL_CONTROLLER_BUTTON_B){page=PROVIDERS;message[0]=0;}
+                if(key==SDL_CONTROLLER_BUTTON_B){
+                    if(open_pending())open_cancel();
+                    page=PROVIDERS;message[0]=0;
+                }
                 if(key==SDL_CONTROLLER_BUTTON_DPAD_UP && source>0)source--;
                 if(key==SDL_CONTROLLER_BUTTON_DPAD_DOWN && source<sn-1)source++;
-                if(key==SDL_CONTROLLER_BUTTON_A && sn){
+                if(key==SDL_CONTROLLER_BUTTON_A && sn && !open_pending()){
                     active_episode_variant=-1;
-                    if(movies[chosen].series){
-                        message[0]=0;
-                        episode_count=uakino_episodes(&sources[source],episodes,
-                                                      EPISODES_MAX,message,sizeof(message));
-                        if(episode_count){
-                            rebuild_seasons();
-                            int last_season=0,last_episode=0;
-                            if(library_last_episode(&movies[chosen],&last_season,
-                                                    &last_episode,NULL))
-                                for(int i=0;i<episode_count;i++)
-                                    if(episodes[i].season==last_season &&
-                                       episodes[i].number==last_episode){
-                                        focus_episode_index(i);break;
-                                    }
-                            page=SEASONS;continue;
-                        }
-                    }
-                    char url[2048]={0};
-                    message[0]=0;
-                    if(!render){
+                    if(!render && !movies[chosen].series){
                         snprintf(message,sizeof(message),"Плеєр mpv не ініціалізовано");
-                    }else if(uakino_resolve(&sources[source],url,sizeof(url),message,sizeof(message))){
-                        snprintf(pending_subtitle,sizeof(pending_subtitle),"%s",uakino_resolved_subtitle());
-                        playing_movie=movies[chosen];
-                        resume_at=library_progress(&playing_movie);
-                        snprintf(playing_url,sizeof(playing_url),"%s",url);
-                        apply_hls_quality(player);
-                        configure_stream(player,url);
-                        command(player,"loadfile",url);
-                        video_started_at=SDL_GetTicks();video_loaded=0;
-                        controls_until=SDL_GetTicks()+3000;
-                        player_return_page=SOURCES;page=PLAYER;
+                    }else if(open_start(&sources[source],movies[chosen].series)){
+                        snprintf(message,sizeof(message),"Відкриття джерела...");
                     }
                 }
             }
         }
+        OpenResult opened;
+        if(open_poll(&opened) && page==SOURCES && sn){
+            snprintf(message,sizeof(message),"%s",opened.message);
+            if(opened.episodes){
+                episode_count=opened.episodes;
+                rebuild_seasons();
+                int last_season=0,last_episode=0;
+                if(library_last_episode(&movies[chosen],&last_season,&last_episode,NULL))
+                    for(int i=0;i<episode_count;i++)
+                        if(episodes[i].season==last_season &&
+                           episodes[i].number==last_episode){
+                            focus_episode_index(i);break;
+                        }
+                message[0]=0;
+                page=SEASONS;
+            }else if(!render){
+                snprintf(message,sizeof(message),"Плеєр mpv не ініціалізовано");
+            }else if(opened.resolved){
+                message[0]=0;
+                snprintf(pending_subtitle,sizeof(pending_subtitle),"%s",opened.subtitle);
+                playing_movie=movies[chosen];
+                resume_at=library_progress(&playing_movie);
+                snprintf(playing_url,sizeof(playing_url),"%s",opened.url);
+                apply_hls_quality(player);
+                configure_stream(player,opened.url);
+                command(player,"loadfile",opened.url);
+                video_started_at=SDL_GetTicks();video_loaded=0;
+                controls_until=SDL_GetTicks()+3000;
+                player_return_page=SOURCES;page=PLAYER;
+            }
+        }
+        prof_mark(PROF_INPUT);
         if(player){
             for (;;) {
                 mpv_event *event=mpv_wait_event(player,0);
@@ -2961,9 +3534,9 @@ int main(void) {
         }
         if(page==CATALOG && category==0 && !expanded_catalog && !query[0] &&
            !home_current_loaded){
-            int count=catalog_home_copy(home_shelf,movies);
+            int count=catalog_home_copy(home_shelf,movies,message,sizeof(message));
             if(count>=0){
-                n=count;chosen=0;home_current_loaded=1;message[0]=0;
+                n=count;chosen=0;home_current_loaded=1;
             }
         }
         /* While the user watches a video without touching the controls, the
@@ -2972,6 +3545,8 @@ int main(void) {
            and auto-sleep only for the duration of video playback. */
         int watching_video=(page==PLAYER || page==TRACK_PICKER ||
                             (page==VIDEO_SETTINGS && !video_settings_from_menu));
+        /* Background downloads would compete with the video stream. */
+        net_background_pause(watching_video);
 #ifdef __vita__
         vita_media_tick(watching_video);
 #else
@@ -2980,6 +3555,7 @@ int main(void) {
             media_playback_mode=watching_video;
         }
 #endif
+        prof_mark(PROF_UPDATE);
         if(page==PLAYER && render){
             ui_theme_enabled=0;
             mpv_opengl_fbo fbo={.fbo=0,.w=1280,.h=720};int flip=1;
@@ -2991,7 +3567,10 @@ int main(void) {
                around a picture that does not fill the display. */
             box_alpha(&paint,0,0,1280,720,0,0,0,1.f,0);
 #endif
+            ui_flush();
+            prof_mark(PROF_DRAW);
             int render_result=mpv_render_context_render(render,frame);
+            prof_mark(PROF_VIDEO);
             /* libmpv explicitly does not preserve all OpenGL state (viewport,
                scissor, blend factors). Without restoring it, transparent
                text glyphs may render as solid white rectangles in Eden. */
@@ -3079,20 +3658,34 @@ int main(void) {
                 posters_prefetch(movies,n,start,expanded_catalog?18:12);
             }
         }
+        ui_flush();
+        prof_mark(PROF_DRAW);
+        prof_draw(&paint);
 #ifdef __vita__
         vita_swap();
 #else
         SDL_GL_SwapWindow(window);
 #endif
+        prof_mark(PROF_SWAP);
+        if(first_frame){prof_boot_step(8);prof_boot_done();first_frame=0;}
         /* Do not stack a fixed sleep on top of the time that Eden/Switch
            already spent drawing or waiting for VSync. */
         Uint32 frame_elapsed=SDL_GetTicks()-frame_started_at;
+#ifdef __vita__
+        /* Menus build in about a millisecond here, so they run at 60 too. */
+        Uint32 frame_budget=16u;
+#else
         Uint32 frame_budget=page==PLAYER?16u:33u;
+#endif
         if(frame_elapsed<frame_budget)SDL_Delay(frame_budget-frame_elapsed);
+        prof_mark(PROF_SLEEP);
+        prof_frame_end();
     }
 #ifndef __vita__
     if(media_playback_mode)appletSetMediaPlaybackState(false);
 #endif
+    net_background_shutdown();
+    if(prof.log){fclose(prof.log);prof.log=NULL;}
     catalog_loader_shutdown();
     free(movies);
     if(render)mpv_render_context_free(render);

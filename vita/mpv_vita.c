@@ -34,6 +34,7 @@
 #include <psp2/videodec.h>
 #include <vitaGL.h>
 
+#include "../source/catalog.h"
 #include "../source/platform.h"
 
 #define SCREEN_W 960
@@ -297,7 +298,7 @@ static long preferred_bandwidth(Session *s) {
     curl_easy_setopt(curl, CURLOPT_USERAGENT, s->user_agent);
     if (s->referrer[0]) curl_easy_setopt(curl, CURLOPT_REFERER, s->referrer);
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
-    curl_easy_setopt(curl, CURLOPT_CAINFO, UAPLAY_CA_BUNDLE);
+    net_tls_options(curl);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, playlist_chunk);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &p);
     curl_easy_perform(curl);
@@ -604,9 +605,9 @@ static int open_software(VideoState *v) {
     v->sw = avcodec_alloc_context3(codec);
     if (!v->sw) return 0;
     avcodec_parameters_to_context(v->sw, v->stream->codecpar);
-    /* FFmpeg's worker threads get the small default pthread stack on the
-       Vita and overflow it; decode on this (1 MiB) thread instead. */
-    v->sw->thread_count = 1;
+    /* Two frame threads use a second core; their stacks come from
+       __wrap_pthread_create, as FFmpeg passes no stack size. */
+    v->sw->thread_count = 2;
     /* The Cortex-A9 cannot afford the deblocking filter at 720p. */
     if (v->stream->codecpar->height > 480) v->sw->skip_loop_filter = AVDISCARD_ALL;
     v->sw->pkt_timebase = v->stream->time_base;
@@ -947,6 +948,21 @@ static void *audio_main(void *opaque) {
 
 /* ---------- demux ---------- */
 
+/* Linked with --wrap=pthread_create: threads created without attributes
+   (FFmpeg's decoder workers) would get a stack too small for H.264. */
+int __real_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
+                          void *(*body)(void *), void *arg);
+int __wrap_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
+                          void *(*body)(void *), void *arg) {
+    if (attr) return __real_pthread_create(thread, attr, body, arg);
+    pthread_attr_t sized;
+    pthread_attr_init(&sized);
+    pthread_attr_setstacksize(&sized, 512 * 1024);
+    int result = __real_pthread_create(thread, &sized, body, arg);
+    pthread_attr_destroy(&sized);
+    return result;
+}
+
 static int start_thread(pthread_t *thread, void *(*body)(void *), void *arg, size_t stack) {
     pthread_attr_t attr;
     pthread_attr_init(&attr);
@@ -1263,7 +1279,7 @@ static void *subtitle_main(void *opaque) {
         curl_easy_setopt(curl, CURLOPT_USERAGENT, r->user_agent);
         if (r->referrer[0]) curl_easy_setopt(curl, CURLOPT_REFERER, r->referrer);
         curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
-        curl_easy_setopt(curl, CURLOPT_CAINFO, UAPLAY_CA_BUNDLE);
+        net_tls_options(curl);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, download_chunk);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &d);
         CURLcode result = curl_easy_perform(curl);

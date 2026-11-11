@@ -27,15 +27,19 @@ LIBS := -L$(DEPS_PREFIX)/lib -lavformat -lavcodec -lswscale -lswresample -lavuti
         -lvitaGL -lvitashark -lSceShaccCgExt -lSceShaccCg_stub -lmathneon -ltaihen_stub \
         -lSceKernelDmacMgr_stub -lSceVideodec_stub -lSceAppUtil_stub -lSceAppMgr_stub \
         -lSceCommonDialog_stub -lSceGxm_stub -lSceDisplay_stub -lSceSysmodule_stub \
-        -lSceAudio_stub -lSceTouch_stub -lSceNet_stub -lSceNetCtl_stub -lSceLibKernel_stub \
+        -lSceAudio_stub -lScePower_stub -lSceTouch_stub -lSceNet_stub -lSceNetCtl_stub -lSceLibKernel_stub \
         -lstdc++ -lpthread -lm -lz
 
-OBJS := $(addprefix $(BUILD)/,main.o catalog.o posters.o library.o playback.o mpv_vita.o vita_platform.o)
+OBJS := $(addprefix $(BUILD)/,main.o catalog.o posters.o library.o playback.o mpv_vita.o vita_platform.o openssl_locks.o)
 ROMFS := $(wildcard romfs/*)
 SCE_SYS := $(BUILD)/sce_sys/icon0.png $(BUILD)/sce_sys/livearea/contents/bg.png \
            $(BUILD)/sce_sys/livearea/contents/startup.png \
            $(BUILD)/sce_sys/livearea/contents/template.xml
 CA_BUNDLE := $(BUILD)/cacert.pem
+# vita/openssl_locks.c: native mutexes for OpenSSL instead of pthread rwlocks.
+OPENSSL_LOCKS := CRYPTO_THREAD_lock_new CRYPTO_THREAD_read_lock CRYPTO_THREAD_write_lock \
+                 CRYPTO_THREAD_unlock CRYPTO_THREAD_lock_free CRYPTO_atomic_add
+OPENSSL_LOCK_WRAPS := $(foreach f,$(OPENSSL_LOCKS),-Wl,--wrap=$(f))
 
 .PHONY: all clean
 all: $(TARGET).vpk
@@ -49,7 +53,7 @@ $(BUILD)/%.o: vita/%.c vita/vita_platform.h vita/include/mpv/*.h source/platform
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/$(TARGET).elf: $(OBJS)
-	$(CC) -Wl,-q -Wl,--gc-sections $^ $(LIBS) -o $@
+	$(CC) -Wl,-q -Wl,--gc-sections -Wl,--wrap=pthread_create $(OPENSSL_LOCK_WRAPS) $^ $(LIBS) -o $@
 
 $(BUILD)/eboot.bin: $(BUILD)/$(TARGET).elf
 	vita-elf-create $< $(BUILD)/$(TARGET).velf

@@ -49,6 +49,14 @@ static PosterLoader loaders[POSTER_WORKERS];
 static SDL_mutex *disk_mutex;
 static int used;
 static unsigned long long cache_clock;
+static void (*flush_draws)(void);
+
+void posters_set_flush(void (*flush)(void)){flush_draws=flush;}
+static unsigned upload_count;
+static double upload_ms;
+void posters_upload_stats(unsigned *count,double *milliseconds){
+    *count=upload_count;*milliseconds=upload_ms;
+}
 
 static size_t receive(char *pointer,size_t size,size_t count,void *ctx){
     ImageData *image=ctx;
@@ -138,9 +146,12 @@ static ImageData download_image(const char *path,CURL *curl,int *ssl_failed){
     curl_easy_setopt(curl,CURLOPT_USERAGENT,"UAPlay-nx/1.0");
     curl_easy_setopt(curl,CURLOPT_WRITEFUNCTION,receive);
     curl_easy_setopt(curl,CURLOPT_WRITEDATA,&data);
-#ifdef UAPLAY_CA_BUNDLE
-    curl_easy_setopt(curl,CURLOPT_CAINFO,UAPLAY_CA_BUNDLE);
-#endif
+    net_tls_options(curl);
+    char curl_error[CURL_ERROR_SIZE]="";
+    curl_easy_setopt(curl,CURLOPT_ERRORBUFFER,curl_error);
+    Uint32 wait_started=SDL_GetTicks();
+    net_background_acquire(0);
+    Uint32 waited=SDL_GetTicks()-wait_started;
     CURLcode result=curl_easy_perform(curl);
     if(result==CURLE_SSL_CONNECT_ERROR){
         /* One bounded retry with a fresh connection; never disable TLS
@@ -151,6 +162,9 @@ static ImageData download_image(const char *path,CURL *curl,int *ssl_failed){
         curl_easy_setopt(curl,CURLOPT_TIMEOUT,4L);
         result=curl_easy_perform(curl);
     }
+    net_background_release(0);
+    net_profile_record('P',curl,url,waited,(int)result,(unsigned)data.used,
+                       curl_error[0]?curl_error:curl_easy_strerror(result));
     long code=0;
     curl_easy_getinfo(curl,CURLINFO_RESPONSE_CODE,&code);
     *ssl_failed=result==CURLE_SSL_CONNECT_ERROR ||
@@ -211,8 +225,18 @@ void posters_init(void){
     }
 }
 
+static GLuint image_texture_timed(const ImageData *data);
+/* JPEG decoding runs here on the UI thread, so the profiler tracks it. */
 static GLuint image_texture(const ImageData *data){
     if(!data->data || !data->used)return 0;
+    Uint64 started=SDL_GetPerformanceCounter();
+    GLuint texture=image_texture_timed(data);
+    upload_ms+=(double)(SDL_GetPerformanceCounter()-started)*1000.0/
+               (double)SDL_GetPerformanceFrequency();
+    upload_count++;
+    return texture;
+}
+static GLuint image_texture_timed(const ImageData *data){
     SDL_RWops *rw=SDL_RWFromConstMem(data->data,(int)data->used);
     SDL_Surface *image=rw?IMG_Load_RW(rw,1):NULL;
     if(!image)return 0;
@@ -240,7 +264,10 @@ static void cache_store(int id,GLuint texture){
         slot=0;
         for(int i=1;i<used;i++)
             if(cache[i].last_used<cache[slot].last_used)slot=i;
-        if(cache[slot].texture)glDeleteTextures(1,&cache[slot].texture);
+        if(cache[slot].texture){
+            if(flush_draws)flush_draws();
+            glDeleteTextures(1,&cache[slot].texture);
+        }
     }else used++;
     cache[slot].id=id;
     cache[slot].texture=texture;
