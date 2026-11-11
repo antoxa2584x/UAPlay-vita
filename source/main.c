@@ -4,18 +4,32 @@
 #include <time.h>
 #include <math.h>
 #include <sys/stat.h>
+#ifdef __vita__
+#include "../vita/vita_platform.h"
+#else
 #include <switch.h>
+#endif
 #include <SDL.h>
 #include <SDL_ttf.h>
 #include <GLES2/gl2.h>
 #include <mpv/client.h>
 #include <mpv/render_gl.h>
 #include <curl/curl.h>
+#include "platform.h"
 #include "catalog.h"
 #include "posters.h"
 #include "library.h"
 #include "playback.h"
 
+/* The interface is laid out in 1280x720 units; the shader maps them to the
+   display, so only pixel-based GL state (viewport, scissor) needs scaling. */
+#ifdef __vita__
+#define SCREEN_W VITA_SCREEN_W
+#define SCREEN_H VITA_SCREEN_H
+#else
+#define SCREEN_W 1280
+#define SCREEN_H 720
+#endif
 typedef enum { CATALOG, DETAILS, PROVIDERS, SOURCES, PLAYER, SETTINGS,
                SEASONS, EPISODES, TRACK_PICKER, VIDEO_SETTINGS } Page;
 static int selected_provider=0;
@@ -31,21 +45,29 @@ static int track_count,selected_track,subtitle_picker;
 #define SOURCE_SUBTITLE_TRACK_BASE 20000
 static int selected_video_option;
 /* Only player controls useful on the console: speed, volume, subtitle size,
-   and HLS quality. Keep mpv's existing option storage intact. */
-static const int visible_video_options[]={0,1,4,6};
+   HLS quality and scaling. Keep mpv's existing option storage intact. */
+static const int visible_video_options[]={0,1,4,6,7};
 #define VIDEO_OPTION_COUNT ((int)(sizeof(visible_video_options)/sizeof(visible_video_options[0])))
-static double video_options[]={1.0,100.0,0.0,0.0,48.0,0.0,0.0};
+static double video_options[]={1.0,100.0,0.0,0.0,48.0,0.0,0.0,0.0};
 static const char *video_props[]={"speed","volume","brightness","contrast",
-                                  "sub-font-size","sub-delay","hls-bitrate"};
+                                  "sub-font-size","sub-delay","hls-bitrate","panscan"};
 static const char *video_titles[]={"Швидкість","Гучність","Яскравість","Контраст",
-                                   "Розмір субтитрів","Затримка субтитрів","Якість HLS"};
-static const double video_steps[]={0.25,5,5,5,4,0.25,1};
-static const double video_min[]={0.5,0,-100,-100,20,-10,0};
-static const double video_max[]={2.0,130,100,100,100,10,4};
+                                   "Розмір субтитрів","Затримка субтитрів","Якість HLS",
+                                   "Масштаб"};
+static const double video_steps[]={0.25,5,5,5,4,0.25,1,1};
+static const double video_min[]={0.5,0,-100,-100,20,-10,0,0};
+static const double video_max[]={2.0,130,100,100,100,10,4,1};
+/* mpv panscan: 0 fits the whole picture, 1 fills the screen and crops. */
+static const char *scale_labels[]={"Вписати","Заповнити"};
 /* HLS bitrate ceilings approximate the requested picture height. Exact
    360/480/720/1080p depends on variant resolutions offered by the source. */
 static const char *hls_presets[]={"max","800000","1500000","3000000","6000000"};
+#ifdef __vita__
+/* Auto picks the variant closest to the 960x544 panel. */
+static const char *hls_labels[]={"Авто (544p)","360p","480p","720p","1080p"};
+#else
 static const char *hls_labels[]={"Авто","360p","480p","720p","1080p"};
+#endif
 
 static void rebuild_seasons(void) {
     season_count=0;
@@ -145,7 +167,7 @@ static int settings_selected=0,ui_accent_alt=0,source_mode=0;
 static int autoplay_episodes=1;
 #define NEXT_EPISODE_DELAY_MS 3000u
 static int ui_light_theme=0,ui_theme_enabled=1,ui_gradient_pass=0;
-#define THEME_PATH "sdmc:/switch/uaplay/theme.txt"
+#define THEME_PATH UAPLAY_DATA_DIR "/theme.txt"
 static void theme_load(void){
     FILE *f=fopen(THEME_PATH,"r");
     if(f){
@@ -157,7 +179,7 @@ static void theme_load(void){
     }
 }
 static void theme_save(void){
-    mkdir("sdmc:/switch/uaplay",0777);
+    mkdir(UAPLAY_DATA_DIR,0777);
     FILE *f=fopen(THEME_PATH,"w");
     if(f){
         fputc(ui_light_theme?'1':'0',f);
@@ -167,6 +189,8 @@ static void theme_save(void){
     }
 }
 static int video_settings_from_menu=0;
+/* Set when opening the video settings paused a playing video. */
+static int video_settings_paused=0;
 static int ui_category=0;
 static int tab_for_category(int category){
     if(category==0)return 0;
@@ -492,6 +516,7 @@ typedef struct {
     TTF_Font *scripts_big[7];
     TTF_Font *scripts_tiny[7];
     TTF_Font *japanese[4];
+    TTF_Font *symbols[4];
 } Paint;
 static const char *script_fonts[]={"Tamil","Telugu","Devanagari","Malayalam",
                                   "Bengali","Arabic","Thai"};
@@ -516,6 +541,12 @@ static TTF_Font *choose_font(Paint *p,const char *s){
                      p->font==p->font_tiny?3:0;
             if(p->japanese[size])return p->japanese[size];
         }
+        /* PlayStation button shapes are absent from Inter. */
+        if(cp>=0x25A0 && cp<=0x27BF){
+            int size=p->font==p->font_big?2:p->font==p->font_small?1:
+                     p->font==p->font_tiny?3:0;
+            if(p->symbols[size])return p->symbols[size];
+        }
         if(idx>=0){
             TTF_Font *fallback=p->font==p->font_big?p->scripts_big[idx]:
                 p->font==p->font_small?p->scripts_small[idx]:
@@ -538,6 +569,14 @@ static const char *fs = "precision mediump float;varying vec2 tc;"
                         "if(outline>0.0){float inside=1.0-smoothstep(-.7,.9,d+outline);"
                         "a=max(a-inside,0.0);}"
                         "vec3 rgb=tint.rgb;"
+                        /* PS Vita wallpapers: dark indigo to ocean blue, or
+                           the pale sky of the light theme, lit diagonally. */
+                        "float sky=tc.y*.78+tc.x*.22;"
+                        "if(gradient>3.5)rgb=mix(vec3(.86,.92,.99),"
+                        "vec3(.58,.74,.93),sky);"
+                        "else if(gradient>2.5)rgb=mix(vec3(.016,.043,.137),"
+                        "vec3(.020,.262,.470),sky);"
+                        "else "
                         /* Switch Basic White / Basic Black: gently shaded,
                            neutral surfaces rather than blue-black or beige. */
                         "if(gradient>1.5)rgb=mix(vec3(.957,.960,.965),"
@@ -566,7 +605,12 @@ static int paint_init(Paint *p) {
     glDeleteShader(vert); glDeleteShader(frag);
     GLint linked=0;
     glGetProgramiv(p->program,GL_LINK_STATUS,&linked);
-    if (!linked) return 0;
+    if (!linked) {
+        char log[512]={0};
+        glGetProgramInfoLog(p->program,sizeof(log),NULL,log);
+        fprintf(stderr,"UAPlay: UI shader link failed: %s\n",log);
+        return 0;
+    }
     p->tint=glGetUniformLocation(p->program,"tint");
     p->shape=glGetUniformLocation(p->program,"shape");
     p->gradient=glGetUniformLocation(p->program,"gradient");
@@ -586,12 +630,12 @@ static int paint_init(Paint *p) {
     glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,1,1,0,GL_RGBA,GL_UNSIGNED_BYTE,white);
     if (TTF_Init()) return 0;
     /* Inter has SF/Helvetica-like proportions and includes Ukrainian glyphs. */
-    p->font=TTF_OpenFont("romfs:/InterVariable.ttf",22);
-    p->font_big=TTF_OpenFont("romfs:/InterVariable.ttf",31);
-    p->font_small=TTF_OpenFont("romfs:/InterVariable.ttf",19);
-    p->font_tiny=TTF_OpenFont("romfs:/InterVariable.ttf",15);
+    p->font=TTF_OpenFont(UAPLAY_ROMFS "InterVariable.ttf",22);
+    p->font_big=TTF_OpenFont(UAPLAY_ROMFS "InterVariable.ttf",31);
+    p->font_small=TTF_OpenFont(UAPLAY_ROMFS "InterVariable.ttf",19);
+    p->font_tiny=TTF_OpenFont(UAPLAY_ROMFS "InterVariable.ttf",15);
     for(int i=0;i<7;i++){
-        char path[96];snprintf(path,sizeof(path),"romfs:/NotoSans%s.ttf",script_fonts[i]);
+        char path[96];snprintf(path,sizeof(path),UAPLAY_ROMFS "NotoSans%s.ttf",script_fonts[i]);
         p->scripts[i]=TTF_OpenFont(path,22);
         p->scripts_small[i]=TTF_OpenFont(path,19);
         p->scripts_big[i]=TTF_OpenFont(path,31);
@@ -599,7 +643,10 @@ static int paint_init(Paint *p) {
     }
     const int jp_sizes[]={22,19,31,15};
     for(int i=0;i<4;i++)
-        p->japanese[i]=TTF_OpenFont("romfs:/NotoSansCJKjp-Regular.otf",jp_sizes[i]);
+        p->japanese[i]=TTF_OpenFont(UAPLAY_ROMFS "NotoSansCJKjp-Regular.otf",jp_sizes[i]);
+    for(int i=0;i<4;i++)
+        p->symbols[i]=TTF_OpenFont(UAPLAY_ROMFS "DejaVuSans.ttf",jp_sizes[i]);
+    if(!p->font)fprintf(stderr,"UAPlay: cannot open UI font: %s\n",TTF_GetError());
     return p->font != NULL;
 }
 static int ui_outline_width=0;
@@ -623,12 +670,23 @@ static void box_alpha(Paint *p,int x,int y,int w,int h,float r,float g,float b,f
         float top=fmaxf(r,fmaxf(g,b)),bottom=fminf(r,fminf(g,b));
         if(top<=.55f && top-bottom<=.22f){
             float v=.2126f*r+.7152f*g+.0722f*b;
+#ifdef __vita__
+            /* PS Vita glass: neutral surfaces become translucent navy that
+               lets the wallpaper glow through; lighter ones are denser. */
+            r=.045f+.50f*v;g=.090f+.58f*v;b=.190f+.66f*v;
+            a*=fminf(1.f,.60f+1.1f*v);
+#else
             r=g=b=.19f+.52f*v;
+#endif
         }
     }
+    float gradient_mode=ui_gradient_pass?(ui_light_theme?2.f:1.f):0.f;
+#ifdef __vita__
+    if(ui_gradient_pass)gradient_mode+=2.f;   /* wallpaper variants */
+#endif
     glUniform4f(p->tint,r,g,b,a);
     glUniform3f(p->shape,(float)w,(float)h,(float)radius);
-    glUniform1f(p->gradient,ui_gradient_pass?(ui_light_theme?2.f:1.f):0.f);
+    glUniform1f(p->gradient,gradient_mode);
     glUniform1f(p->outline,(float)ui_outline_width);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D,p->tex);
@@ -773,7 +831,8 @@ static void text_color(Paint *p,const char *str,int x,int y,int limit,
     /* Never shrink a long title: clip it at the card edge instead. */
     if(limit>0){
         glEnable(GL_SCISSOR_TEST);
-        glScissor(x,720-y-height,limit,height);
+        glScissor(x*SCREEN_W/1280,(720-y-height)*SCREEN_H/720,
+                  (limit*SCREEN_W+1279)/1280,(height*SCREEN_H+719)/720);
     }
     box_alpha(p,x,y,width,height,r,g,b,1.f,0);
     if(limit>0)glDisable(GL_SCISSOR_TEST);
@@ -865,7 +924,23 @@ static void summary(Paint *p,const char *description,int x,int y,int width){
 static void card_title(Paint *p,const char *title,int x,int y,int width){
     wrapped(p,title,x,y,width,2,24,p->font_small,.95f,.96f,.98f);
 }
+/* Fill of the active tab/row/option. The Vita uses its system blue; the
+   Switch keeps each control's own slightly lighter neutral. */
+#ifdef __vita__
+static const float vita_selected[3]={.13f,.40f,.82f};
+/* Theme mapping inverts saturated colours in the light theme; pre-invert so
+   the blue survives. */
+#define SEL(value,channel) (ui_light_theme?1.f-vita_selected[channel]:vita_selected[channel])
+#else
+#define SEL(value,channel) (value)
+#endif
 static void accent(float *r,float *g,float *b){
+#ifdef __vita__
+    /* PS Vita highlight blue; pre-inverted for the light theme. */
+    if(ui_light_theme){*r=.87f;*g=.55f;*b=.05f;}
+    else{*r=.38f;*g=.76f;*b=1.f;}
+    return;
+#endif
     if(ui_light_theme){
         /* Pre-inverted Switch blue; actual output approximately #4465D5. */
         *r=.73f;*g=.60f;*b=.16f;
@@ -884,16 +959,41 @@ static void selection_frame(Paint *p,int x,int y,int w,int h){
     float g=ui_light_theme?.13f:.67f;
     float b=ui_light_theme?.20f:.85f;
     int radius=h>=60?18:h>=40?17:12;
+#ifdef __vita__
+    /* Vita focus: a bright cyan-white ring inside a pulsing blue halo. */
+    if(ui_light_theme){r=.78f;g=.45f;b=.02f;}else{r=.62f;g=.88f;b=1.f;}
+    radius=h<=64?h/2+3:radius;
+#endif
     ui_outline_width=3;
     float opacity=.94f+.06f*sinf(SDL_GetTicks()*.005f);
     /* The focused control briefly settles inward when A is pressed. */
     if(SDL_GetTicks()-ui_press_at<95){x++;y++;w-=2;h-=2;}
+#ifdef __vita__
+    ui_outline_width=7;
+    box_alpha(p,x-8,y-8,w+16,h+16,r,g,b,.16f+.10f*sinf(SDL_GetTicks()*.004f),radius+5);
+    ui_outline_width=3;
+#endif
     box_alpha(p,x-3,y-3,w+6,h+6,r,g,b,opacity,radius);
     ui_outline_width=0;
 }
 static void button(Paint *p,const char *label,int x,int y,int w,int h,int primary){
     /* Flat fills: no simulated border/shadow in Basic White. */
     float secondary=ui_light_theme?.11f:.15f;
+#ifdef __vita__
+    /* Vita pill buttons: system blue for the main action, glass otherwise. */
+    if(primary){
+        box_alpha(p,x,y,w,h,SEL(0,0),SEL(0,1),SEL(0,2),1.f,h/2);
+        if(!ui_light_theme)
+            box_alpha(p,x+6,y+2,w-12,h/2-2,1.f,1.f,1.f,.14f,h/4);   /* gloss */
+        /* White in both themes (neutral text is inverted in the light one). */
+        float ink=ui_light_theme?.02f:.98f;
+        text_center_button(p,label,x,y,w,h,p->font_small,ink,ink,ink);
+        return;
+    }
+    box_alpha(p,x,y,w,h,secondary,secondary,secondary,1.f,h/2);
+    text_center_button(p,label,x,y,w,h,p->font_small,.95f,.96f,.98f);
+    return;
+#endif
     box_alpha(p,x,y,w,h,primary?.89f:secondary,primary?.91f:secondary,
               primary?.94f:secondary,1.f,14);
     text_center_button(p,label,x,y,w,h,p->font_small,
@@ -952,24 +1052,141 @@ static void gear_icon(Paint *p,int cx,int cy,float bg_r,float bg_g,float bg_b){
     polygon(p,teeth,48,fg,fg,fg);
     box_alpha(p,cx-5,cy-5,10,10,bg_r,bg_g,bg_b,1.f,5);
 }
+#ifdef __vita__
+/* One horizontal band following a wave, as a single triangle strip. The
+   texture coordinates stay at the centre of the SDF box, so the strip is
+   flat-filled; the soft edge comes from stacking wider, fainter layers. */
+#define RIBBON_STEP 20
+#define RIBBON_POINTS (1320/RIBBON_STEP+2)
+static void vita_ribbon(Paint *p,const float *centre,float half,float a){
+    float vertices[RIBBON_POINTS*2*4];
+    for(int i=0;i<RIBBON_POINTS;i++){
+        float x=(float)(-20+i*RIBBON_STEP)/640.f-1.f;
+        float *v=&vertices[i*8];
+        v[0]=x;v[1]=1.f-(centre[i]-half)/360.f;v[2]=v[3]=.5f;
+        v[4]=x;v[5]=1.f-(centre[i]+half)/360.f;v[6]=v[7]=.5f;
+    }
+    glUseProgram(p->program);
+    glUniform4f(p->tint,1.f,1.f,1.f,a);
+    glUniform3f(p->shape,100.f,100.f,0.f);
+    glUniform1f(p->gradient,0.f);
+    glUniform1f(p->outline,0.f);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D,p->solid_tex);
+    glBindBuffer(GL_ARRAY_BUFFER,p->vbo);
+    glBufferData(GL_ARRAY_BUFFER,sizeof(vertices),vertices,GL_STREAM_DRAW);
+    glEnableVertexAttribArray(0);glEnableVertexAttribArray(1);
+    glVertexAttribPointer(0,2,GL_FLOAT,GL_FALSE,4*sizeof(float),(void*)0);
+    glVertexAttribPointer(1,2,GL_FLOAT,GL_FALSE,4*sizeof(float),(void*)(2*sizeof(float)));
+    glDrawArrays(GL_TRIANGLE_STRIP,0,RIBBON_POINTS*2);
+}
+/* PS Vita home-screen look: a lit gradient with slowly drifting ribbons of
+   light, each a few layered strips so its edges fade out smoothly. */
+static void vita_wallpaper(Paint *p){
+    ui_gradient_pass=1;
+    box_alpha(p,0,0,1280,720,0,0,0,1.f,0);
+    ui_gradient_pass=0;
+    float t=SDL_GetTicks()*.00035f;
+    const float base[]={250,420,560},amp[]={46,60,38},freq[]={.0062f,.0047f,.0081f};
+    const float thick[]={46,70,30},alpha[]={.022f,.016f,.026f},speed[]={1.f,-.7f,1.4f};
+    const float layers[]={1.f,.82f,.64f,.47f,.31f,.16f};
+    float centre[RIBBON_POINTS];
+    for(int k=0;k<3;k++){
+        for(int i=0;i<RIBBON_POINTS;i++){
+            float x=(float)(-20+i*RIBBON_STEP);
+            centre[i]=base[k]+amp[k]*sinf(x*freq[k]+t*speed[k]+k*1.7f)
+                      +18.f*sinf(x*.013f-t*1.3f+k);
+        }
+        for(int l=0;l<6;l++)
+            vita_ribbon(p,centre,thick[k]*layers[l],
+                        ui_light_theme?alpha[k]*3.f:alpha[k]);
+    }
+}
+/* Vita status area: compact clock and a battery gauge, top right. */
+static void vita_status(Paint *p,int right,int y){
+    int charging=0,level=vita_battery(&charging);
+    int bx=right-46,by=y+7;
+    float ink=.95f;
+    ui_outline_width=2;
+    box_alpha(p,bx,by,40,22,ink,ink,ink,1.f,5);
+    ui_outline_width=0;
+    box_alpha(p,bx+40,by+7,4,8,ink,ink,ink,1.f,2);
+    if(level>=0){
+        int fill=level*34/100;
+        float r=level<=15?.95f:charging?.35f:.92f;
+        float g=level<=15?.30f:charging?.86f:.94f;
+        float b=level<=15?.28f:charging?.46f:.97f;
+        if(fill>0)box_alpha(p,bx+3,by+3,fill,16,r,g,b,1.f,3);
+    }
+    time_t now=time(NULL);
+    struct tm *local=localtime(&now);
+    char clock_label[16]="--:--";
+    if(local)strftime(clock_label,sizeof(clock_label),"%H:%M",local);
+    int w=measure(p,clock_label,p->font_small);
+    text_font(p,clock_label,bx-14-w,y+6,w+4,p->font_small,.96f,.97f,.99f);
+}
+/* Top y for a PlayStation symbol so its ink box is vertically centred on
+   the capitals of a label drawn at label_y with font_small. Symbol glyphs
+   sit at different heights, so a fixed offset leaves some of them off. */
+static int vita_glyph_top(Paint *p,const char *key,int label_y){
+    TTF_Font *previous=p->font;
+    p->font=p->font_big;
+    TTF_Font *font=choose_font(p,key);
+    p->font=previous;
+    const unsigned char *u=(const unsigned char*)key;
+    unsigned cp=u[0]>=0xE0 && u[1] && u[2]?
+                ((u[0]&15)<<12)|((u[1]&63)<<6)|(u[2]&63):u[0];
+    int minx,maxx,miny,maxy,advance;
+    if(!font || TTF_GlyphMetrics32(font,cp,&minx,&maxx,&miny,&maxy,&advance))
+        return label_y-10;
+    float cap=TTF_FontAscent(p->font_small)-TTF_FontHeight(p->font_small)*.30f;
+    float target=label_y+cap;                       /* label's cap centre */
+    float ink=TTF_FontAscent(font)-(miny+maxy)*.5f; /* glyph centre in its line */
+    return (int)(target-ink+.5f);
+}
+/* PlayStation symbol colours: Cross blue, Circle red, Square pink,
+   Triangle green. Returns 0 for keys drawn as grey badges. */
+static int vita_glyph_color(const char *key,float *r,float *g,float *b){
+    if(!strcmp(key,"✕")){*r=.49f;*g=.70f;*b=.94f;}
+    else if(!strcmp(key,"○")){*r=.98f;*g=.42f;*b=.45f;}
+    else if(!strcmp(key,"□")){*r=.90f;*g=.56f;*b=.86f;}
+    else if(!strcmp(key,"△")){*r=.30f;*g=.86f;*b=.68f;}
+    else return 0;
+    if(ui_light_theme){*r=1.f-*r;*g=1.f-*g;*b=1.f-*b;}
+    return 1;
+}
+#endif
 static void screen_header(Paint *p,const char *name,const char *context){
     box_alpha(p,0,0,1280,92,.058f,.069f,.083f,1.f,0);
     box_alpha(p,UI_EDGE,23,55,48,.13f,.16f,.20f,1.f,13);
     text_center(p,"‹",UI_EDGE,25,55,p->font_big,.96f,.97f,.99f);
     headline(p,name,105,23,860);
+#ifdef __vita__
+    /* The status area sits where the Switch layout shows the context. */
+    vita_status(p,1250,25);
+    if(context && *context && strcmp(context,"UAPlay"))
+        text_tiny(p,context,800,38,300);
+#else
     if(context && *context && strcmp(context,"UAPlay"))
         text_tiny(p,context,979,38,264);
+#endif
 }
 static void list_row(Paint *p,const char *title,int y,int selected,
                      const char *detail){
     box_alpha(p,UI_EDGE,y,1216,UI_ROW_HEIGHT,
-              selected?.20f:.085f,selected?.30f:.105f,
-              selected?.38f:.135f,1.f,12);
+              selected?SEL(.20f,0):.085f,selected?SEL(.30f,1):.105f,
+              selected?SEL(.38f,2):.135f,1.f,12);
     if(selected){
         float r,g,b;accent(&r,&g,&b);
         box_alpha(p,UI_EDGE,y+9,4,UI_ROW_HEIGHT-18,r,g,b,1.f,2);
         selection_frame(p,UI_EDGE,y,1216,UI_ROW_HEIGHT);
     }
+#ifdef __vita__
+    if(selected){
+        float ink=ui_light_theme?0.f:1.f;   /* white on the blue fill */
+        text_color(p,title,UI_EDGE+22,y+9,detail?915:1155,ink,ink,ink);
+    }else
+#endif
     text(p,title,UI_EDGE+22,y+9,detail?915:1155);
     if(detail)text_muted(p,detail,1052,y+13,178);
 }
@@ -987,7 +1204,7 @@ static void footer(Paint *p,const char *message) {
     const char *keys[6],*labels[6];int count=0;
 #define HINT(k,l) do{keys[count]=k;labels[count]=l;count++;}while(0)
     if(footer_page==CATALOG){
-        HINT("L","Розділ");HINT("R","Розділ");
+        HINT("L/R","Розділ");
         HINT("X","Пошук");HINT("−","Меню");HINT("A","Відкрити");
         if(ui_category==0 && !expanded_catalog)HINT("↑↓","Добірка");
         if(expanded_catalog)HINT("B","Згорнути");
@@ -1009,6 +1226,18 @@ static void footer(Paint *p,const char *message) {
         HINT("↑↓","Вибір");HINT("A","Відкрити");HINT("B","Назад");
     }
 #undef HINT
+#ifdef __vita__
+    /* Same actions, PlayStation names: A Cross, B Circle, X Square,
+       Y Triangle, Minus Select (Cross/Circle swap on Japanese consoles). */
+    int circle=vita_enter_is_circle();
+    for(int i=0;i<count;i++){
+        if(!strcmp(keys[i],"A"))keys[i]=circle?"○":"✕";
+        else if(!strcmp(keys[i],"B"))keys[i]=circle?"✕":"○";
+        else if(!strcmp(keys[i],"X"))keys[i]="□";
+        else if(!strcmp(keys[i],"Y"))keys[i]="△";
+        else if(!strcmp(keys[i],"−"))keys[i]="SELECT";
+    }
+#endif
     int widths[6]={0},total=0;
     for(int i=0;i<count;i++){
         int badge_width=measure(p,keys[i],p->font_small)+12;
@@ -1023,7 +1252,21 @@ static void footer(Paint *p,const char *message) {
         int badge_width=measure(p,keys[i],p->font_small)+12;
         if(badge_width<30)badge_width=30;
         int round=(!strcmp(keys[i],"A")||!strcmp(keys[i],"B")||
-                   !strcmp(keys[i],"X")||!strcmp(keys[i],"Y"));
+                   !strcmp(keys[i],"X")||!strcmp(keys[i],"Y")||
+                   !strcmp(keys[i],"✕")||!strcmp(keys[i],"○")||
+                   !strcmp(keys[i],"□")||!strcmp(keys[i],"△"));
+#ifdef __vita__
+        float gr,gg,gb;
+        if(vita_glyph_color(keys[i],&gr,&gg,&gb)){
+            /* Large coloured symbol, as in the Vita system UI. */
+            text_center(p,keys[i],x,vita_glyph_top(p,keys[i],681),badge_width,
+                        p->font_big,gr,gg,gb);
+            text_font(p,labels[i],x+badge_width+8,681,widths[i]-badge_width-8,
+                      p->font_small,.88f,.91f,.95f);
+            x+=widths[i]+12;
+            continue;
+        }
+#endif
         box_alpha(p,x,681,badge_width,28,ar,ag,ab,1.f,round?14:5);
         text_center(p,keys[i],x,682,badge_width,p->font_small,.09f,.11f,.13f);
         text_font(p,labels[i],x+badge_width+8,681,widths[i]-badge_width-8,
@@ -1059,15 +1302,108 @@ static void poster(Paint *p,const Movie *movie,int x,int y,int width,int height,
                            p->font_tiny,.98f,.96f,.88f);
     }
 }
+/* Source prefetch: as soon as a title's details open, one worker searches
+   every provider in turn, so the provider list can show only those with
+   results and opening one is instant. */
+#define PROVIDER_COUNT 7
+typedef struct {
+    int done,count;
+    Source items[UAKINO_MAX];
+} ProviderResult;
+static ProviderResult provider_results[PROVIDER_COUNT];
+static SDL_Thread *prefetch_thread;
+static SDL_mutex *prefetch_mutex;
+static SDL_cond *prefetch_cond;
+static Movie prefetch_movie;
+static int prefetch_generation,prefetch_pending,prefetch_has_movie;
+static int prefetch_worker(void *opaque){
+    (void)opaque;
+    catalog_http_bind_source_thread();
+    static Source found[UAKINO_MAX];
+    for(;;){
+        SDL_LockMutex(prefetch_mutex);
+        while(!prefetch_pending)SDL_CondWait(prefetch_cond,prefetch_mutex);
+        prefetch_pending=0;
+        Movie movie=prefetch_movie;
+        int generation=prefetch_generation;
+        SDL_UnlockMutex(prefetch_mutex);
+        for(int i=0;i<PROVIDER_COUNT;i++){
+            SDL_LockMutex(prefetch_mutex);
+            int stale=generation!=prefetch_generation;
+            SDL_UnlockMutex(prefetch_mutex);
+            if(stale)break;
+            char error[256];
+            int count=uakino_search_provider(&movie,found,UAKINO_MAX,i+1,
+                                             error,sizeof(error));
+            count=catalog_rank_sources(&movie,found,count,source_mode);
+            SDL_LockMutex(prefetch_mutex);
+            if(generation==prefetch_generation){
+                ProviderResult *r=&provider_results[i];
+                r->count=count;
+                memcpy(r->items,found,sizeof(Source)*(size_t)count);
+                r->done=1;
+            }
+            SDL_UnlockMutex(prefetch_mutex);
+        }
+    }
+    return 0;
+}
+/* Restart the search when the opened title changes. */
+static void sources_prefetch(const Movie *movie){
+    if(!prefetch_mutex){
+        prefetch_mutex=SDL_CreateMutex();
+        prefetch_cond=SDL_CreateCond();
+        if(!prefetch_mutex || !prefetch_cond)return;
+        prefetch_thread=SDL_CreateThread(prefetch_worker,"source-prefetch",NULL);
+        if(!prefetch_thread)return;
+        SDL_DetachThread(prefetch_thread);
+    }
+    SDL_LockMutex(prefetch_mutex);
+    if(!prefetch_has_movie || prefetch_movie.id!=movie->id ||
+       prefetch_movie.series!=movie->series){
+        prefetch_movie=*movie;
+        prefetch_has_movie=1;
+        prefetch_generation++;
+        prefetch_pending=1;
+        for(int i=0;i<PROVIDER_COUNT;i++)
+            provider_results[i].done=provider_results[i].count=0;
+        SDL_CondSignal(prefetch_cond);
+    }
+    SDL_UnlockMutex(prefetch_mutex);
+}
+/* Providers that returned results, in menu order. *searching is set while
+   some providers have not answered yet. */
+static int visible_providers(int *out,int *searching){
+    int count=0,pending=0;
+    if(prefetch_mutex)SDL_LockMutex(prefetch_mutex);
+    for(int i=0;i<PROVIDER_COUNT;i++){
+        if(!provider_results[i].done)pending=1;
+        else if(provider_results[i].count>0)out[count++]=i;
+    }
+    if(prefetch_mutex)SDL_UnlockMutex(prefetch_mutex);
+    if(searching)*searching=pending;
+    return count;
+}
+static int provider_copy(int provider,Source *items){
+    SDL_LockMutex(prefetch_mutex);
+    int count=provider_results[provider].count;
+    memcpy(items,provider_results[provider].items,sizeof(Source)*(size_t)count);
+    SDL_UnlockMutex(prefetch_mutex);
+    return count;
+}
 static void draw(Paint *p,Page page,Movie *movies,int n,int chosen,
                  Source *sources,int sn,int source,const char *heading,const char *status) {
-    glViewport(0,0,1280,720);
+    glViewport(0,0,SCREEN_W,SCREEN_H);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
     ui_theme_enabled=1;
+#ifdef __vita__
+    vita_wallpaper(p);
+#else
     ui_gradient_pass=1;
     box_alpha(p,0,0,1280,720,.034f,.042f,.054f,1.f,0);
     ui_gradient_pass=0;
+#endif
     static int previous_page=-1,previous_category=-1,previous_home_shelf=-1;
     static Uint32 transition_at=0;
     if(previous_page!=(int)page ||
@@ -1099,7 +1435,7 @@ static void draw(Paint *p,Page page,Movie *movies,int n,int chosen,
                        (i==2 && ui_category>=2 && ui_category<=10) ||
                        (i==3 && ui_category>=ANIMATION_FIRST && ui_category<=ANIMATION_LAST) ||
                        (i==4 && (ui_category==11 || ui_category==12));
-            if(active)box_alpha(p,x-12,19,tab_w[i],43,.19f,.24f,.28f,1.f,16);
+            if(active)box_alpha(p,x-12,19,tab_w[i],43,SEL(.19f,0),SEL(.24f,1),SEL(.28f,2),1.f,16);
             if(catalog_hero_focus==i+7)selection_frame(p,x-12,19,tab_w[i],43);
             text_center_button(p,tabs[i],x-12,19,tab_w[i],43,
                                p->font_small,.96f,.97f,.99f);
@@ -1113,11 +1449,15 @@ static void draw(Paint *p,Page page,Movie *movies,int n,int chosen,
         box_alpha(p,1058,17,53,47,.13f,.16f,.19f,1.f,15);
         if(catalog_hero_focus==6)selection_frame(p,1058,17,53,47);
         gear_icon(p,1085,40,.13f,.16f,.19f);
+#ifdef __vita__
+        vita_status(p,1250,25);
+#else
         time_t now=time(NULL);
         struct tm *local=localtime(&now);
         char clock_label[32]="--:--";
         if(local)strftime(clock_label,sizeof(clock_label),"%H:%M",local);
         text_font(p,clock_label,1140,21,116,p->font_big,.95f,.97f,.99f);
+#endif
         if(ui_category==11 || ui_category==12){
             /* Favorites uses a poster-only library layout, without the hero.
                Both tabs stay reachable even when their list is empty. */
@@ -1126,8 +1466,8 @@ static void draw(Paint *p,Page page,Movie *movies,int n,int chosen,
             for(int i=0;i<2;i++){
                 int selected=ui_category==11+i;
                 box_alpha(p,tab_x[i],101,tab_w[i],47,
-                          selected?.20f:.12f,selected?.28f:.15f,
-                          selected?.35f:.19f,1.f,13);
+                          selected?SEL(.20f,0):.12f,selected?SEL(.28f,1):.15f,
+                          selected?SEL(.35f,2):.19f,1.f,13);
                 if(catalog_hero_focus==16+i)
                     selection_frame(p,tab_x[i],101,tab_w[i],47);
                 text_center_button(p,names[i],tab_x[i],101,tab_w[i],47,
@@ -1158,9 +1498,9 @@ static void draw(Paint *p,Page page,Movie *movies,int n,int chosen,
             for(int i=0;i<2;i++){
                 int active=catalog_sort_mode==sort_mode_for_button(i);
                 box_alpha(p,sort_x[i],98,sort_w[i],44,
-                          active?.20f:.10f,
-                          active?.27f:.14f,
-                          active?.33f:.18f,1.f,12);
+                          active?SEL(.20f,0):.10f,
+                          active?SEL(.27f,1):.14f,
+                          active?SEL(.33f,2):.18f,1.f,12);
                 if(catalog_hero_focus==12+i)
                     selection_frame(p,sort_x[i],98,sort_w[i],44);
                 text_center_button(p,sort_labels[i],sort_x[i],98,sort_w[i],44,
@@ -1227,8 +1567,8 @@ static void draw(Paint *p,Page page,Movie *movies,int n,int chosen,
                     int selected=ui_category==category_for_subsection(ui_category,i);
                     int x=films?film_x[i]:anim_x[i],w=films?film_w[i]:anim_w[i];
                     box_alpha(p,x,328,w,43,
-                              selected?.20f:.12f,selected?.28f:.15f,
-                              selected?.35f:.19f,1.f,13);
+                              selected?SEL(.20f,0):.12f,selected?SEL(.28f,1):.15f,
+                              selected?SEL(.35f,2):.19f,1.f,13);
                     if(catalog_hero_focus==i+16)
                         selection_frame(p,x,328,w,43);
                     text_center_button(p,films?film_labels[i]:animation_tabs[i],x,328,
@@ -1255,13 +1595,17 @@ static void draw(Paint *p,Page page,Movie *movies,int n,int chosen,
         const char *items[]={"Тема","Інтерфейс","Плеєр","Автовідтворення"};
         for(int i=0;i<4;i++){
             int y=136+i*88;
-            box_alpha(p,32,y,417,72,i==settings_selected?.20f:.09f,
-                      i==settings_selected?.29f:.11f,
-                      i==settings_selected?.37f:.14f,1.f,16);
+            box_alpha(p,32,y,417,72,i==settings_selected?SEL(.20f,0):.09f,
+                      i==settings_selected?SEL(.29f,1):.11f,
+                      i==settings_selected?SEL(.37f,2):.14f,1.f,16);
             if(i==settings_selected){float r,g,b;accent(&r,&g,&b);
                 box_alpha(p,32,y+15,5,42,r,g,b,1.f,2);}
             if(i==settings_selected){
                 float r,g,b;accent(&r,&g,&b);
+#ifdef __vita__
+                /* White on the blue fill (neutral text is inverted in light). */
+                r=g=b=ui_light_theme?0.f:1.f;
+#endif
                 text_font(p,items[i],55,y+(72-text_height(p,items[i],p->font))/2,
                           372,p->font,r,g,b);
                 selection_frame(p,32,y,417,72);
@@ -1323,10 +1667,21 @@ static void draw(Paint *p,Page page,Movie *movies,int n,int chosen,
                320,526,255,58,0);
         footer(p,status);
     } else if (page==PROVIDERS) {
-        screen_header(p,"Оберіть джерело","Пошук почнеться після вибору");
-        for(int i=0;i<7;i++)
-            list_row(p,provider_names[i],UI_ROW_Y+i*UI_ROW_STEP,
-                     i==selected_provider,NULL);
+        int visible[PROVIDER_COUNT],searching=0;
+        int count=visible_providers(visible,&searching);
+        screen_header(p,"Оберіть джерело",searching?"Пошук у джерелах…":NULL);
+        for(int i=0;i<count;i++){
+            char found[24];
+            snprintf(found,sizeof(found),"%d",provider_results[visible[i]].count);
+            list_row(p,provider_names[visible[i]],UI_ROW_Y+i*UI_ROW_STEP,
+                     i==selected_provider,found);
+        }
+        if(searching)
+            text_center_button(p,"Пошук…",UI_EDGE,UI_ROW_Y+count*UI_ROW_STEP,1216,
+                               UI_ROW_HEIGHT,p->font,.73f,.77f,.82f);
+        else if(!count)
+            text_center_button(p,"Нічого не знайдено",UI_EDGE,305,1216,110,
+                               p->font_big,.73f,.77f,.82f);
         footer(p,status);
     } else if (page==SOURCES) {
         screen_header(p,"Джерела відео",NULL);
@@ -1378,14 +1733,15 @@ static void draw(Paint *p,Page page,Movie *movies,int n,int chosen,
         for(int i=0;i<VIDEO_OPTION_COUNT;i++) {
             int option=visible_video_options[i];
             int y=132+i*68;
-            box_alpha(p,UI_EDGE,y,1216,60,i==selected_video_option?.20f:.09f,
-                      i==selected_video_option?.30f:.11f,
-                      i==selected_video_option?.38f:.14f,1.f,13);
+            box_alpha(p,UI_EDGE,y,1216,60,i==selected_video_option?SEL(.20f,0):.09f,
+                      i==selected_video_option?SEL(.30f,1):.11f,
+                      i==selected_video_option?SEL(.38f,2):.14f,1.f,13);
             text_font(p,video_titles[option],55,
                       y+(60-text_height(p,video_titles[option],p->font))/2,
                       830,p->font,.96f,.97f,.98f);
             char value[48];
             if(option==6)snprintf(value,sizeof(value),"%s",hls_labels[(int)video_options[option]]);
+            else if(option==7)snprintf(value,sizeof(value),"%s",scale_labels[(int)video_options[option]]);
             else if(option==0)snprintf(value,sizeof(value),"%.2f",video_options[option]);
             else snprintf(value,sizeof(value),"%.0f",video_options[option]);
             text_center_button(p,value,963,y,240,60,p->font,.95f,.96f,.98f);
@@ -1434,7 +1790,7 @@ static void draw_player_controls(Paint *p,mpv_handle *player) {
         mpv_get_property(player,"duration",MPV_FORMAT_DOUBLE,&duration);
         mpv_get_property(player,"pause",MPV_FORMAT_FLAG,&paused);
     }
-    glViewport(0,0,1280,720);
+    glViewport(0,0,SCREEN_W,SCREEN_H);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
     box_alpha(p,32,27,141,49,.045f,.063f,.079f,.92f,14);
@@ -1496,6 +1852,14 @@ static void draw_next_episode_prompt(Paint *p,const Episode *next,int seconds){
     text_small(p,"A — дивитися зараз     B — скасувати",286,448,690);
 }
 static int native_button(int button) {
+#ifdef __vita__
+    /* SDL reports Cross as A and Circle as B, which already matches the
+       Western confirm/back convention. */
+    if(!vita_enter_is_circle())return button;
+    if(button==SDL_CONTROLLER_BUTTON_A)return SDL_CONTROLLER_BUTTON_B;
+    if(button==SDL_CONTROLLER_BUTTON_B)return SDL_CONTROLLER_BUTTON_A;
+    return button;
+#endif
     /* SDL uses Xbox-style face button names; Switch prints the opposite labels. */
     switch(button) {
         case SDL_CONTROLLER_BUTTON_A:return SDL_CONTROLLER_BUTTON_B;
@@ -1536,22 +1900,46 @@ static void configure_stream(mpv_handle *player,const char *url) {
     else mpv_set_property_string(player,"referrer","");
 }
 static int keyboard(char *value,size_t size) {
+#ifdef __vita__
+    return vita_keyboard(value,size);
+#else
     SwkbdConfig cfg;
     if(R_FAILED(swkbdCreate(&cfg,0))) return 0;
     swkbdConfigMakePresetDefault(&cfg);
     Result result=swkbdShow(&cfg,value,size);
     swkbdClose(&cfg);
     return R_SUCCEEDED(result) && value[0];
+#endif
 }
 int main(void) {
+#ifdef __vita__
+    if(!vita_platform_init())return 1;
+#else
     romfsInit();
+#endif
     library_init();
     theme_load();
+#ifdef __vita__
+    int network_ready=vita_network_init();
+#else
     Result network_result = socketInitializeDefault();
-    if (R_SUCCEEDED(network_result)) curl_global_init(CURL_GLOBAL_DEFAULT);
+    int network_ready=R_SUCCEEDED(network_result);
+#endif
+    if (network_ready) curl_global_init(CURL_GLOBAL_DEFAULT);
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS,"1");
-    if(SDL_Init(SDL_INIT_VIDEO|SDL_INIT_GAMECONTROLLER)) return 1;
+#ifdef __vita__
+    /* curl + OpenSSL handshakes overflow SDL's 64 KiB default thread stack. */
+    SDL_SetHint(SDL_HINT_THREAD_STACK_SIZE,"1048576");
+#endif
+    if(SDL_Init(SDL_INIT_VIDEO|SDL_INIT_GAMECONTROLLER)){
+        fprintf(stderr,"UAPlay: SDL_Init failed: %s\n",SDL_GetError());
+        return 1;
+    }
     catalog_http_init();
+#ifdef __vita__
+    /* vitaGL owns the display; SDL only supplies input, fonts and images. */
+    SDL_Window *window=NULL;
+#else
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,SDL_GL_CONTEXT_PROFILE_ES);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION,3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION,0);
@@ -1559,6 +1947,7 @@ int main(void) {
     if(!window) { SDL_Quit();return 2; }
     SDL_GLContext gl=SDL_GL_CreateContext(window);
     if(!gl) { SDL_DestroyWindow(window);SDL_Quit();return 3; }
+#endif
     Paint paint={0};
     if(!paint_init(&paint)) goto cleanup;
     posters_init();
@@ -1613,10 +2002,15 @@ int main(void) {
     Uint32 next_episode_countdown_at=0;
     Uint32 stick_last_time=0;
     int stick_last_key=0;
+#ifndef __vita__
     int media_playback_mode=0;
+#endif
     while(running){
         Uint32 frame_started_at=SDL_GetTicks();
         stick_arrow(pad,&stick_last_time,&stick_last_key);
+#ifdef __vita__
+        vita_poll_touch();
+#endif
         SDL_Event e;
         while(SDL_PollEvent(&e)){
             if(e.type==SDL_QUIT)running=0;
@@ -1661,6 +2055,11 @@ int main(void) {
                     int was_visible=SDL_GetTicks()<controls_until;
                     controls_until=SDL_GetTicks()+3000;
                     if(!was_visible)continue;
+                    /* A drag scrubs the timeline or volume; only a new touch
+                       presses buttons (a held finger must not re-toggle pause). */
+                    int dragging=e.type==SDL_FINGERMOTION || e.type==SDL_MOUSEMOTION;
+                    if(dragging && !(ty>=547 && ty<=594 && tx>=118 && tx<=1161) &&
+                       !(ty>=632 && ty<674 && tx>=60 && tx<259))continue;
                     if(ty>=24 && ty<=83 && tx>=27 && tx<=180)key=SDL_CONTROLLER_BUTTON_B;
                     else if(ty>=24 && ty<=83 && tx>=969 && tx<=1244 &&
                             active_episode_variant>=0 &&
@@ -1769,7 +2168,9 @@ int main(void) {
                         if(ty>=326 && ty<375 && tx>=1095){
                             catalog_hero_focus=3;key=SDL_CONTROLLER_BUTTON_A;
                         }
-                        if(subsection_count(category) && ty>=326 && ty<375){
+                        /* "Усі ›" shares this row with the sub-tabs; its tap
+                           must not be swallowed by the sub-tab handler. */
+                        else if(subsection_count(category) && ty>=326 && ty<375){
                             const int anim_x[]={32,240,465},anim_w[]={191,208,134};
                             const int film_x[]={32,197,373,513,672},film_w[]={157,168,132,151,225};
                             int film=tab_for_category(category)==2;
@@ -1808,6 +2209,14 @@ int main(void) {
                             }
                         }
                     }
+                }else if(page==PROVIDERS){
+                    int visible[PROVIDER_COUNT];
+                    int count=visible_providers(visible,NULL);
+                    int slot=(ty-UI_ROW_Y)/UI_ROW_STEP;
+                    if(ty>=UI_ROW_Y && (ty-UI_ROW_Y)%UI_ROW_STEP<UI_ROW_HEIGHT &&
+                       slot>=0 && slot<count){
+                        selected_provider=slot;key=SDL_CONTROLLER_BUTTON_A;
+                    }else if(ty<92 && tx<100)key=SDL_CONTROLLER_BUTTON_B;
                 }else if(page==SOURCES){
                     int slot=(ty-UI_ROW_Y)/UI_ROW_STEP,new_source=source/UI_ROWS*UI_ROWS+slot;
                     if(ty>=UI_ROW_Y && (ty-UI_ROW_Y)%UI_ROW_STEP<UI_ROW_HEIGHT &&
@@ -1963,6 +2372,11 @@ int main(void) {
                 }
                 if(key==SDL_CONTROLLER_BUTTON_BACK){
                     selected_video_option=0;
+                    /* Hold the picture while the settings cover it. */
+                    int paused=1;
+                    if(player)mpv_get_property(player,"pause",MPV_FORMAT_FLAG,&paused);
+                    video_settings_paused=!paused;
+                    if(video_settings_paused)mpv_set_property_string(player,"pause","yes");
                     page=VIDEO_SETTINGS;
                 }
                 continue;
@@ -2034,6 +2448,9 @@ int main(void) {
             if(page==VIDEO_SETTINGS){
                 if(key==SDL_CONTROLLER_BUTTON_B || key==SDL_CONTROLLER_BUTTON_BACK){
                     page=video_settings_from_menu?SETTINGS:PLAYER;
+                    if(!video_settings_from_menu && video_settings_paused && player)
+                        mpv_set_property_string(player,"pause","no");
+                    video_settings_paused=0;
                     video_settings_from_menu=0;
                 }
                 if(key==SDL_CONTROLLER_BUTTON_DPAD_UP && selected_video_option>0)selected_video_option--;
@@ -2377,17 +2794,16 @@ int main(void) {
                     }
                 }
             }else if(page==PROVIDERS){
+                int visible[PROVIDER_COUNT];
+                int count=visible_providers(visible,NULL);
                 if(key==SDL_CONTROLLER_BUTTON_B){page=DETAILS;message[0]=0;}
                 if(key==SDL_CONTROLLER_BUTTON_DPAD_UP && selected_provider>0)
                     selected_provider--;
-                if(key==SDL_CONTROLLER_BUTTON_DPAD_DOWN && selected_provider<6)
+                if(key==SDL_CONTROLLER_BUTTON_DPAD_DOWN && selected_provider<count-1)
                     selected_provider++;
-                if(key==SDL_CONTROLLER_BUTTON_A){
+                if(key==SDL_CONTROLLER_BUTTON_A && selected_provider<count){
                     message[0]=0;
-                    sn=uakino_search_provider(&movies[chosen],sources,UAKINO_MAX,
-                                              selected_provider+1,message,sizeof(message));
-                    sn=catalog_rank_sources(&movies[chosen],sources,sn,source_mode);
-                    if(!sn)snprintf(message,sizeof(message),"Нічого не знайдено");
+                    sn=provider_copy(visible[selected_provider],sources);
                     source=0;page=SOURCES;
                 }
             }else if(page==SOURCES){
@@ -2537,6 +2953,12 @@ int main(void) {
         }
         catalog_loader_poll(&movies,&n,&movie_capacity,chosen,category,query);
         catalog_details_poll(movies,n);
+        if((page==DETAILS || page==PROVIDERS) && chosen<n)sources_prefetch(&movies[chosen]);
+        if(page==PROVIDERS){
+            int visible[PROVIDER_COUNT];
+            int count=visible_providers(visible,NULL);
+            if(selected_provider>=count)selected_provider=count?count-1:0;
+        }
         if(page==CATALOG && category==0 && !expanded_catalog && !query[0] &&
            !home_current_loaded){
             int count=catalog_home_copy(home_shelf,movies);
@@ -2550,22 +2972,31 @@ int main(void) {
            and auto-sleep only for the duration of video playback. */
         int watching_video=(page==PLAYER || page==TRACK_PICKER ||
                             (page==VIDEO_SETTINGS && !video_settings_from_menu));
+#ifdef __vita__
+        vita_media_tick(watching_video);
+#else
         if(watching_video!=media_playback_mode){
             appletSetMediaPlaybackState(watching_video!=0);
             media_playback_mode=watching_video;
         }
+#endif
         if(page==PLAYER && render){
             ui_theme_enabled=0;
             mpv_opengl_fbo fbo={.fbo=0,.w=1280,.h=720};int flip=1;
             mpv_render_param frame[]={{MPV_RENDER_PARAM_OPENGL_FBO,&fbo},
                                       {MPV_RENDER_PARAM_FLIP_Y,&flip},
                                       {MPV_RENDER_PARAM_INVALID,NULL}};
+#ifdef __vita__
+            /* Black letterbox bars: the previous screen must never show
+               around a picture that does not fill the display. */
+            box_alpha(&paint,0,0,1280,720,0,0,0,1.f,0);
+#endif
             int render_result=mpv_render_context_render(render,frame);
             /* libmpv explicitly does not preserve all OpenGL state (viewport,
                scissor, blend factors). Without restoring it, transparent
                text glyphs may render as solid white rectangles in Eden. */
             glBindFramebuffer(GL_FRAMEBUFFER,0);
-            glViewport(0,0,1280,720);
+            glViewport(0,0,SCREEN_W,SCREEN_H);
             glDisable(GL_SCISSOR_TEST);
             glDisable(GL_DEPTH_TEST);
             glDisable(GL_CULL_FACE);
@@ -2586,7 +3017,9 @@ int main(void) {
                     box_alpha(&paint,640+(int)(sx[i]*42)-6,340+(int)(sy[i]*42)-6,
                               13,13,bright,bright,bright,1.f,6);
                 }
-                text_color(&paint,"Завантаження відео",507,426,310,.76f,.78f,.82f);
+                /* Centred under the spinner (x=640), whatever the font width. */
+                text_center(&paint,"Завантаження відео",440,426,400,paint.font,
+                            .76f,.78f,.82f);
                 if(video_started_at && SDL_GetTicks()-video_started_at>30000){
                     snprintf(message,sizeof(message),"Час очікування відео вичерпано (30 с)");
                     command(player,"stop",NULL);page=player_return_page;
@@ -2595,6 +3028,28 @@ int main(void) {
                 snprintf(message,sizeof(message),"Помилка відеорендерера mpv: %s",mpv_error_string(render_result));
                 command(player,"stop",NULL);page=player_return_page;
             }
+#ifdef __vita__
+            /* libmpv draws subtitles itself; the Vita player hands over the
+               current cue and the UI fonts render it. */
+            char cue[512];
+            if(video_loaded && mpv_vita_subtitle(player,cue,sizeof(cue))){
+                int lines=1;
+                for(const char *c=cue;*c;c++)if(*c=='\n')lines++;
+                if(lines>3)lines=3;
+                int bottom=SDL_GetTicks()<controls_until?492:676;
+                char *line=cue;
+                for(int i=0;i<lines && line;i++){
+                    char *next=strchr(line,'\n');
+                    if(next)*next++=0;
+                    int y=bottom-(lines-i)*38;
+                    int w=measure(&paint,line,paint.font)+28;
+                    if(w>1240)w=1240;
+                    box_alpha(&paint,640-w/2,y-3,w,36,0,0,0,.62f,8);
+                    text_center(&paint,line,20,y,1240,paint.font,1,1,1);
+                    line=next;
+                }
+            }
+#endif
             if(video_loaded && SDL_GetTicks()<controls_until)draw_player_controls(&paint,player);
             if(pending_next_episode>=0){
                 Uint32 elapsed=SDL_GetTicks()-next_episode_countdown_at;
@@ -2624,14 +3079,20 @@ int main(void) {
                 posters_prefetch(movies,n,start,expanded_catalog?18:12);
             }
         }
+#ifdef __vita__
+        vita_swap();
+#else
         SDL_GL_SwapWindow(window);
+#endif
         /* Do not stack a fixed sleep on top of the time that Eden/Switch
            already spent drawing or waiting for VSync. */
         Uint32 frame_elapsed=SDL_GetTicks()-frame_started_at;
         Uint32 frame_budget=page==PLAYER?16u:33u;
         if(frame_elapsed<frame_budget)SDL_Delay(frame_budget-frame_elapsed);
     }
+#ifndef __vita__
     if(media_playback_mode)appletSetMediaPlaybackState(false);
+#endif
     catalog_loader_shutdown();
     free(movies);
     if(render)mpv_render_context_free(render);
@@ -2647,6 +3108,7 @@ int main(void) {
         if(paint.scripts_tiny[i])TTF_CloseFont(paint.scripts_tiny[i]);
     }
     for(int i=0;i<4;i++)if(paint.japanese[i])TTF_CloseFont(paint.japanese[i]);
+    for(int i=0;i<4;i++)if(paint.symbols[i])TTF_CloseFont(paint.symbols[i]);
     if(paint.font_tiny)TTF_CloseFont(paint.font_tiny);
     if(paint.font_small)TTF_CloseFont(paint.font_small);
     if(paint.font_big)TTF_CloseFont(paint.font_big);
@@ -2655,8 +3117,15 @@ int main(void) {
     glDeleteBuffers(1,&paint.vbo);
     glDeleteProgram(paint.program);
 cleanup:
+#ifdef __vita__
+    (void)window;
+    SDL_Quit();
+    if (network_ready) { curl_global_cleanup(); vita_network_exit(); }
+    vita_platform_exit();
+#else
     SDL_GL_DeleteContext(gl);
     SDL_DestroyWindow(window);SDL_Quit();romfsExit();
-    if (R_SUCCEEDED(network_result)) { curl_global_cleanup(); socketExit(); }
+    if (network_ready) { curl_global_cleanup(); socketExit(); }
+#endif
     return 0;
 }

@@ -39,10 +39,12 @@ typedef struct {
     char voice[96];
 } Episode;
 
-/* Keep two independent HTTPS connection pools: UI and background TMDB loader.
-   Call cleanup only after the loader thread has stopped. */
+/* Keep independent HTTPS connection pools: UI, background TMDB loader and
+   source prefetch. Call cleanup only after the loader thread has stopped. */
 void catalog_http_init(void);
 void catalog_http_cleanup(void);
+/* Give the calling thread (the source prefetch worker) its own pool. */
+void catalog_http_bind_source_thread(void);
 
 /* NRO includes a public TMDB key; optional SD override under switch/uaplay. */
 int catalog_load(const char *category, const char *query, Movie *items, int max,

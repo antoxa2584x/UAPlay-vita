@@ -1,4 +1,5 @@
 #include "catalog.h"
+#include "platform.h"
 
 #include <curl/curl.h>
 #include <ctype.h>
@@ -8,12 +9,12 @@
 #include <sys/stat.h>
 #include <time.h>
 
-#ifdef __SWITCH__
+#ifdef UAPLAY_CONSOLE
 #include <SDL.h>
 #endif
 
-#define TMDB_KEY_PATH "sdmc:/switch/uaplay/tmdb.key"
-#define TMDB_LEGACY_KEY_PATH "sdmc:/switch/lampa-nx/tmdb.key"
+#define TMDB_KEY_PATH UAPLAY_DATA_DIR "/tmdb.key"
+#define TMDB_LEGACY_KEY_PATH UAPLAY_DATA_ROOT "/lampa-nx/tmdb.key"
 /* The release workflow injects this header from a GitHub Actions secret.
    Keep credentials out of the public source tree. */
 #if defined(__has_include)
@@ -31,12 +32,12 @@ static void json_field(const char *object,const char *end,const char *key,
                        char *value,size_t size);
 
 #define COUNTRY_CACHE_LIMIT 4096
-#define COUNTRY_CACHE_PATH "sdmc:/switch/uaplay/country_cache.tsv"
-#define COUNTRY_CACHE_TMP "sdmc:/switch/uaplay/country_cache.tmp"
+#define COUNTRY_CACHE_PATH UAPLAY_DATA_DIR "/country_cache.tsv"
+#define COUNTRY_CACHE_TMP UAPLAY_DATA_DIR "/country_cache.tmp"
 typedef struct { int id,series,allowed; } CountryCacheEntry;
 static CountryCacheEntry country_cache[COUNTRY_CACHE_LIMIT];
 static int country_cache_count,country_cache_evict;
-#ifdef __SWITCH__
+#ifdef UAPLAY_CONSOLE
 static SDL_mutex *country_cache_mutex;
 #define COUNTRY_LOCK() do { if(country_cache_mutex) SDL_LockMutex(country_cache_mutex); } while(0)
 #define COUNTRY_UNLOCK() do { if(country_cache_mutex) SDL_UnlockMutex(country_cache_mutex); } while(0)
@@ -49,9 +50,10 @@ static SDL_mutex *country_cache_mutex;
    tears down HTTPS/TLS sockets. Eden's socket emulation can eventually fail
    new connections even though existing poster requests still work. Keep
    one reusable handle per calling thread, never shared concurrently. */
-#ifdef __SWITCH__
-static SDL_threadID catalog_ui_thread;
-static CURL *catalog_connections[2];
+#ifdef UAPLAY_CONSOLE
+static SDL_threadID catalog_ui_thread,catalog_source_thread;
+/* 0: UI thread, 1: catalogue worker, 2: source prefetch worker. */
+static CURL *catalog_connections[3];
 static void country_cache_load(void){
     FILE *file=fopen(COUNTRY_CACHE_PATH,"r");
     if(!file)return;
@@ -66,7 +68,7 @@ static void country_cache_load(void){
     fclose(file);
 }
 static void country_cache_save(void){
-    mkdir("sdmc:/switch/uaplay",0777);
+    mkdir(UAPLAY_DATA_DIR,0777);
     FILE *file=fopen(COUNTRY_CACHE_TMP,"w");
     if(!file)return;
     for(int i=0;i<country_cache_count;i++)
@@ -81,6 +83,8 @@ void catalog_http_init(void) {
 }
 void catalog_http_cleanup(void) {
     country_cache_save();
+    /* Slot 2 belongs to the detached source prefetch worker, which may
+       still be mid-request at exit. */
     for (int i = 0; i < 2; i++) {
         if (catalog_connections[i]) curl_easy_cleanup(catalog_connections[i]);
         catalog_connections[i] = NULL;
@@ -88,11 +92,17 @@ void catalog_http_cleanup(void) {
     if(country_cache_mutex){SDL_DestroyMutex(country_cache_mutex);country_cache_mutex=NULL;}
 }
 static CURL **catalog_connection_slot(void) {
-    return &catalog_connections[SDL_ThreadID() == catalog_ui_thread ? 0 : 1];
+    SDL_threadID self = SDL_ThreadID();
+    return &catalog_connections[self == catalog_ui_thread ? 0 :
+                                self == catalog_source_thread ? 2 : 1];
+}
+void catalog_http_bind_source_thread(void) {
+    catalog_source_thread = SDL_ThreadID();
 }
 #else
 void catalog_http_init(void) { }
 void catalog_http_cleanup(void) { }
+void catalog_http_bind_source_thread(void) { }
 #endif
 
 static size_t on_data(char *ptr, size_t size, size_t count, void *opaque) {
@@ -132,10 +142,13 @@ static void request_options(CURL *curl, const char *url, Response *r,
     }else curl_easy_setopt(curl, CURLOPT_USERAGENT, "Lampa-nx/0.2 (Nintendo Switch)");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, on_data);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, r);
-#ifdef __SWITCH__
+#ifdef UAPLAY_CONSOLE
     /* Console/Eden socket layers can advertise IPv6 without routing it. */
     curl_easy_setopt(curl, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
     curl_easy_setopt(curl, CURLOPT_MAXCONNECTS, 4L);
+#endif
+#ifdef UAPLAY_CA_BUNDLE
+    curl_easy_setopt(curl, CURLOPT_CAINFO, UAPLAY_CA_BUNDLE);
 #endif
 }
 
@@ -153,7 +166,7 @@ static int transient_network_error(CURLcode result) {
    timeout, and retry behaviour as GET, including on Switch. */
 static char *request_form(const char *url, const char *post_data,
                           const char *referer, char *error, int error_size) {
-#ifdef __SWITCH__
+#ifdef UAPLAY_CONSOLE
     CURL **slot = catalog_connection_slot();
     if (!*slot) *slot = curl_easy_init();
     CURL *curl = *slot;
@@ -185,7 +198,7 @@ static char *request_form(const char *url, const char *post_data,
         if (r.data) r.data[0] = 0;
         curl_easy_cleanup(curl);
         curl = curl_easy_init();
-#ifdef __SWITCH__
+#ifdef UAPLAY_CONSOLE
         *slot = curl;
 #endif
         if (curl) {
@@ -203,7 +216,7 @@ static char *request_form(const char *url, const char *post_data,
     }
     long status = 0;
     if (curl) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
-#ifdef __SWITCH__
+#ifdef UAPLAY_CONSOLE
     if (result != CURLE_OK && curl) {
         curl_easy_cleanup(curl);
         *slot = NULL;
@@ -289,7 +302,7 @@ static char *read_offline_catalog(const char *category) {
     const char *name = !strcmp(category, "series") ? "series" :
                        !strcmp(category, "top") ? "top" : "movies";
     char path[80];
-    snprintf(path, sizeof(path), "romfs:/%s.json", name);
+    snprintf(path, sizeof(path), UAPLAY_ROMFS "%s.json", name);
     FILE *file = fopen(path, "rb");
     if (!file) return NULL;
     if (fseek(file, 0, SEEK_END)) { fclose(file); return NULL; }
@@ -470,7 +483,11 @@ int catalog_load_page_sorted(const char *category, const char *query, int page,
     char key[256];
     tmdb_key(key,sizeof(key));
     if (!key[0]) {
+#ifdef __vita__
+        snprintf(error,error_size,"TMDB: додайте ux0:data/uaplay/tmdb.key");
+#else
         snprintf(error,error_size,"TMDB: додайте /switch/uaplay/tmdb.key на SD-карту");
+#endif
         return 0;
     }
 

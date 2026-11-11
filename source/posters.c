@@ -1,4 +1,5 @@
 #include "posters.h"
+#include "platform.h"
 
 #include <SDL.h>
 #include <SDL_image.h>
@@ -21,7 +22,7 @@
 /* Fixed-size disk cache: at most 96 compressed posters, never an unbounded
    folder of thousands of image files from long TMDB searches. */
 #define POSTER_DISK_SLOTS 96
-#define POSTER_DISK_DIR "sdmc:/switch/uaplay/posters"
+#define POSTER_DISK_DIR UAPLAY_DATA_DIR "/posters"
 #define POSTER_DISK_MAGIC 0x55415032u
 
 typedef struct {
@@ -137,6 +138,9 @@ static ImageData download_image(const char *path,CURL *curl,int *ssl_failed){
     curl_easy_setopt(curl,CURLOPT_USERAGENT,"UAPlay-nx/1.0");
     curl_easy_setopt(curl,CURLOPT_WRITEFUNCTION,receive);
     curl_easy_setopt(curl,CURLOPT_WRITEDATA,&data);
+#ifdef UAPLAY_CA_BUNDLE
+    curl_easy_setopt(curl,CURLOPT_CAINFO,UAPLAY_CA_BUNDLE);
+#endif
     CURLcode result=curl_easy_perform(curl);
     if(result==CURLE_SSL_CONNECT_ERROR){
         /* One bounded retry with a fresh connection; never disable TLS
@@ -192,7 +196,7 @@ static int download_worker(void *opaque){
 }
 
 void posters_init(void){
-    mkdir("sdmc:/switch/uaplay",0777);
+    mkdir(UAPLAY_DATA_DIR,0777);
     mkdir(POSTER_DISK_DIR,0777);
     disk_mutex=SDL_CreateMutex();
     for(int i=0;i<POSTER_WORKERS;i++){

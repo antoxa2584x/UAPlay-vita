@@ -1,17 +1,18 @@
 #include "library.h"
+#include "platform.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
-#define LIBRARY_DIR "sdmc:/switch/uaplay"
+#define LIBRARY_DIR UAPLAY_DATA_DIR
 #define LIBRARY_FILE LIBRARY_DIR "/library.tsv"
 #define LIBRARY_TMP LIBRARY_DIR "/library.tmp"
 #define LIBRARY_BACKUP LIBRARY_DIR "/library.bak"
 /* Older UAFlix/UAPlay builds used this folder. Import once, retaining the
    original file as a safety copy so an NRO update never loses favorites. */
-#define LEGACY_LIBRARY_FILE "sdmc:/switch/uaflix/library.tsv"
+#define LEGACY_LIBRARY_FILE UAPLAY_DATA_ROOT "/uaflix/library.tsv"
 #define MAX_LIBRARY_ITEMS 1024
 
 typedef struct {
@@ -53,7 +54,7 @@ static void clean_field(char *out, size_t capacity, const char *in) {
 }
 
 static void library_save(void) {
-    mkdir("sdmc:/switch",0777);
+    mkdir(UAPLAY_DATA_ROOT,0777);
     mkdir(LIBRARY_DIR,0777);
     FILE *file=fopen(LIBRARY_TMP,"wb");
     if (!file) return;

@@ -1,0 +1,87 @@
+# PS Vita build: make -f Makefile.vita
+# Needs VitaSDK with the vdpm packages sdl2 sdl2_ttf sdl2_image openssl-1.1.1
+# zstd freetype harfbuzz libpng libjpeg-turbo libwebp and vitaGL, plus curl
+# and FFmpeg built by vita/build-curl.sh and vita/build-ffmpeg.sh into
+# DEPS_PREFIX (curl/FFmpeg from vdpm lack OpenSSL 1.1 and network input).
+
+ifeq ($(strip $(VITASDK)),)
+$(error Set VITASDK to the VitaSDK installation directory)
+endif
+
+TARGET := UAPlay
+TITLE_ID := UAPL00001
+APP_VER := 00.50
+BUILD := vita/build
+DEPS_PREFIX ?= $(HOME)/uaplay-vita-deps
+CC := $(VITASDK)/bin/arm-vita-eabi-gcc
+PKG := PKG_CONFIG_LIBDIR=$(VITASDK)/arm-vita-eabi/lib/pkgconfig pkg-config
+
+CFLAGS := -O2 -g -Wall -Wextra -ffunction-sections -fdata-sections \
+          -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard \
+          -Ivita/include -Isource -I$(DEPS_PREFIX)/include \
+          $(shell $(PKG) --cflags sdl2 SDL2_ttf SDL2_image libcurl)
+# DEPS_PREFIX first so its curl and FFmpeg win over the vdpm packages.
+# OpenSSL's "-pthread" would link libpthread a second time.
+LIBS := -L$(DEPS_PREFIX)/lib -lavformat -lavcodec -lswscale -lswresample -lavutil \
+        $(filter-out -pthread,$(shell $(PKG) --libs --static SDL2_ttf SDL2_image sdl2 libcurl)) -lharfbuzz \
+        -lvitaGL -lvitashark -lSceShaccCgExt -lSceShaccCg_stub -lmathneon -ltaihen_stub \
+        -lSceKernelDmacMgr_stub -lSceVideodec_stub -lSceAppUtil_stub -lSceAppMgr_stub \
+        -lSceCommonDialog_stub -lSceGxm_stub -lSceDisplay_stub -lSceSysmodule_stub \
+        -lSceAudio_stub -lSceTouch_stub -lSceNet_stub -lSceNetCtl_stub -lSceLibKernel_stub \
+        -lstdc++ -lpthread -lm -lz
+
+OBJS := $(addprefix $(BUILD)/,main.o catalog.o posters.o library.o playback.o mpv_vita.o vita_platform.o)
+ROMFS := $(wildcard romfs/*)
+SCE_SYS := $(BUILD)/sce_sys/icon0.png $(BUILD)/sce_sys/livearea/contents/bg.png \
+           $(BUILD)/sce_sys/livearea/contents/startup.png \
+           $(BUILD)/sce_sys/livearea/contents/template.xml
+CA_BUNDLE := $(BUILD)/cacert.pem
+
+.PHONY: all clean
+all: $(TARGET).vpk
+
+$(BUILD)/%.o: source/%.c source/*.h vita/vita_platform.h vita/include/mpv/*.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/%.o: vita/%.c vita/vita_platform.h vita/include/mpv/*.h source/platform.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/$(TARGET).elf: $(OBJS)
+	$(CC) -Wl,-q -Wl,--gc-sections $^ $(LIBS) -o $@
+
+$(BUILD)/eboot.bin: $(BUILD)/$(TARGET).elf
+	vita-elf-create $< $(BUILD)/$(TARGET).velf
+	vita-make-fself -s -c $(BUILD)/$(TARGET).velf $@
+
+$(BUILD)/param.sfo:
+	@mkdir -p $(BUILD)
+	vita-mksfoex -s TITLE_ID=$(TITLE_ID) -s APP_VER=$(APP_VER) -d ATTRIBUTE2=12 "$(TARGET)" $@
+
+# LiveArea images must be 8-bit palette PNGs.
+$(BUILD)/sce_sys/icon0.png: icon.jpg
+	@mkdir -p $(dir $@)
+	convert $< -resize 128x128! -colors 256 PNG8:$@
+$(BUILD)/sce_sys/livearea/contents/bg.png: icon.jpg
+	@mkdir -p $(dir $@)
+	convert -size 840x500 xc:'#0b1220' \( $< -resize 360x360 \) -gravity center -composite -colors 256 PNG8:$@
+$(BUILD)/sce_sys/livearea/contents/startup.png: icon.jpg
+	@mkdir -p $(dir $@)
+	convert -size 280x158 xc:'#0b1220' \( $< -resize 140x140 \) -gravity center -composite -colors 256 PNG8:$@
+$(BUILD)/sce_sys/livearea/contents/template.xml: vita/livearea/template.xml
+	@mkdir -p $(dir $@)
+	cp $< $@
+
+$(CA_BUNDLE):
+	@mkdir -p $(BUILD)
+	curl -fL --retry 3 -o $@ https://curl.se/ca/cacert.pem
+
+$(TARGET).vpk: $(BUILD)/eboot.bin $(BUILD)/param.sfo $(SCE_SYS) $(CA_BUNDLE) $(ROMFS)
+	vita-pack-vpk -s $(BUILD)/param.sfo -b $(BUILD)/eboot.bin \
+	  $(foreach f,$(SCE_SYS),-a $(f)=$(patsubst $(BUILD)/%,%,$(f))) \
+	  -a $(CA_BUNDLE)=romfs/cacert.pem \
+	  $(foreach f,$(ROMFS),-a $(f)=$(f)) $@
+
+clean:
+	rm -rf $(BUILD) $(TARGET).vpk
