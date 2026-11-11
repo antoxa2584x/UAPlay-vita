@@ -10,7 +10,7 @@ endif
 
 TARGET := UAPlay
 TITLE_ID := UAPL00001
-APP_VER := 00.50
+APP_VER := 00.51
 BUILD := vita/build
 DEPS_PREFIX ?= $(HOME)/uaplay-vita-deps
 CC := $(VITASDK)/bin/arm-vita-eabi-gcc
@@ -30,7 +30,8 @@ LIBS := -L$(DEPS_PREFIX)/lib -lavformat -lavcodec -lswscale -lswresample -lavuti
         -lSceAudio_stub -lScePower_stub -lSceTouch_stub -lSceNet_stub -lSceNetCtl_stub -lSceLibKernel_stub \
         -lstdc++ -lpthread -lm -lz
 
-OBJS := $(addprefix $(BUILD)/,main.o catalog.o posters.o library.o playback.o mpv_vita.o vita_platform.o openssl_locks.o)
+OBJS := $(addprefix $(BUILD)/,main.o catalog.o posters.o library.o playback.o mpv_vita.o vita_platform.o openssl_locks.o \
+                                 downloads.o)
 ROMFS := $(wildcard romfs/*)
 SCE_SYS := $(BUILD)/sce_sys/icon0.png $(BUILD)/sce_sys/livearea/contents/bg.png \
            $(BUILD)/sce_sys/livearea/contents/startup.png \
@@ -59,7 +60,7 @@ $(BUILD)/eboot.bin: $(BUILD)/$(TARGET).elf
 	vita-elf-create $< $(BUILD)/$(TARGET).velf
 	vita-make-fself -s -c $(BUILD)/$(TARGET).velf $@
 
-$(BUILD)/param.sfo:
+$(BUILD)/param.sfo: Makefile.vita
 	@mkdir -p $(BUILD)
 	vita-mksfoex -s TITLE_ID=$(TITLE_ID) -s APP_VER=$(APP_VER) -d ATTRIBUTE2=12 "$(TARGET)" $@
 

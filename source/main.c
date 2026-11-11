@@ -21,6 +21,7 @@
 #include "posters.h"
 #include "library.h"
 #include "playback.h"
+#include "downloads.h"
 
 /* The interface is laid out in 1280x720 units; the shader maps them to the
    display, so only pixel-based GL state (viewport, scissor) needs scaling. */
@@ -32,7 +33,12 @@
 #define SCREEN_H 720
 #endif
 typedef enum { CATALOG, DETAILS, PROVIDERS, SOURCES, PLAYER, SETTINGS,
-               SEASONS, EPISODES, TRACK_PICKER, VIDEO_SETTINGS } Page;
+               SEASONS, EPISODES, TRACK_PICKER, VIDEO_SETTINGS, DOWNLOADS } Page;
+/* Downloads page: selected row, the item awaiting a second delete press,
+   and the episode a downloaded file holds (0 for a film). */
+static int download_selected;
+static unsigned download_confirm;
+static int download_season,download_episode;
 static int selected_provider=0;
 static const char *provider_names[]={"UAFlix","UASerials","Eneyida",
     "UAFilm","UAKino","Mikai (аніме)","AnimeON (аніме)"};
@@ -1415,7 +1421,11 @@ static void footer(Paint *p,const char *message) {
     }else if(footer_page==SEASONS){
         HINT("↑↓","Сезон");HINT("A","Серії");HINT("B","Назад");
     }else if(footer_page==EPISODES){
-        HINT("↑↓","Серія");HINT("A","Дивитися");HINT("B","Назад");
+        HINT("↑↓","Серія");HINT("A","Дивитися");HINT("Y","Завантажити");HINT("B","Назад");
+    }else if(footer_page==SOURCES){
+        HINT("↑↓","Вибір");HINT("A","Відкрити");HINT("Y","Завантажити");HINT("B","Назад");
+    }else if(footer_page==DOWNLOADS){
+        HINT("↑↓","Вибір");HINT("A","Дивитися");HINT("X","Видалити");HINT("B","Назад");
     }else{
         HINT("↑↓","Вибір");HINT("A","Відкрити");HINT("B","Назад");
     }
@@ -1442,6 +1452,26 @@ static void footer(Paint *p,const char *message) {
     total+=(count-1)*12;
     int x=1244-total;
     if(x<204)x=204;
+    /* Downloads in progress: a badge between the position and the hints,
+       on every screen with a footer. */
+    int download_permille;
+    unsigned long long download_bytes;
+    int pending=downloads_progress(&download_permille,&download_bytes);
+    if(pending>0){
+        char badge[48],more[16]="";
+        if(pending>1)snprintf(more,sizeof(more)," +%d",pending-1);
+        if(download_permille>=0)
+            snprintf(badge,sizeof(badge),"↓ %d%%%s",download_permille/10,more);
+        else snprintf(badge,sizeof(badge),"↓ %u МБ%s",(unsigned)(download_bytes>>20),more);
+        int width=measure(p,badge,p->font_small)+28;
+        if(width<=x-12-196){
+            box_alpha(p,196,677,width,34,.11f,.33f,.62f,.95f,17);
+            if(download_permille>0)
+                box_alpha(p,196+8,705,(width-16)*download_permille/1000,3,
+                          .62f,.82f,1.f,1.f,1);
+            text_center(p,badge,196,681,width,p->font_small,.97f,.98f,1.f);
+        }
+    }
     for(int i=0;i<count;i++){
         int badge_width=measure(p,keys[i],p->font_small)+12;
         if(badge_width<30)badge_width=30;
@@ -1610,12 +1640,17 @@ typedef struct {
     int episodes;        /* episode list (series) or 0 */
     int resolved;        /* stream address found */
     char url[2048],subtitle[1024],message[256];
+    /* A download request: only the address, queued with this item. */
+    int download,season,episode;
+    Movie movie;
+    char label[96];
 } OpenResult;
 static SDL_mutex *open_mutex;
 static SDL_cond *open_cond;
 static int open_requested,open_busy,open_ready,open_generation,open_job_generation;
 static Source open_source;
 static int open_series;
+static OpenResult open_download;
 static OpenResult open_result;
 static Episode open_episodes[EPISODES_MAX];
 static int open_worker(void *opaque){
@@ -1628,9 +1663,11 @@ static int open_worker(void *opaque){
         open_requested=0;
         Source source=open_source;
         int series=open_series,generation=open_job_generation;
+        result=open_download;
         SDL_UnlockMutex(open_mutex);
-        memset(&result,0,sizeof(result));
-        if(series)
+        result.episodes=result.resolved=0;
+        result.url[0]=result.subtitle[0]=result.message[0]=0;
+        if(series && !result.download)
             result.episodes=uakino_episodes(&source,open_episodes,EPISODES_MAX,
                                             result.message,sizeof(result.message));
         if(!result.episodes){
@@ -1648,8 +1685,9 @@ static int open_worker(void *opaque){
     }
     return 0;
 }
-/* Returns 0 while a previous open is still running. */
-static int open_start(const Source *source,int series){
+/* Returns 0 while a previous open is still running. With download set,
+   only the stream address is resolved, for the item given. */
+static int open_start(const Source *source,int series,const OpenResult *download){
     if(!open_mutex){
         open_mutex=SDL_CreateMutex();
         open_cond=SDL_CreateCond();
@@ -1663,6 +1701,8 @@ static int open_start(const Source *source,int series){
     if(started){
         open_source=*source;
         open_series=series;
+        memset(&open_download,0,sizeof(open_download));
+        if(download)open_download=*download;
         open_job_generation=++open_generation;
         open_busy=open_requested=1;
         SDL_CondSignal(open_cond);
@@ -1788,14 +1828,14 @@ static void draw(Paint *p,Page page,Movie *movies,int n,int chosen,
         if(ui_category==11 || ui_category==12){
             /* Favorites uses a poster-only library layout, without the hero.
                Both tabs stay reachable even when their list is empty. */
-            const char *names[]={"На майбутнє","Історія"};
-            const int tab_x[]={32,244},tab_w[]={196,158};
-            for(int i=0;i<2;i++){
-                int selected=ui_category==11+i;
+            const char *names[]={"На майбутнє","Історія","Завантажені"};
+            const int tab_x[]={32,244,418},tab_w[]={196,158,196},focus[]={16,17,19};
+            for(int i=0;i<3;i++){
+                int selected=i<2 && ui_category==11+i;
                 box_alpha(p,tab_x[i],101,tab_w[i],47,
                           selected?SEL(.20f,0):.12f,selected?SEL(.28f,1):.15f,
                           selected?SEL(.35f,2):.19f,1.f,13);
-                if(catalog_hero_focus==16+i)
+                if(catalog_hero_focus==focus[i])
                     selection_frame(p,tab_x[i],101,tab_w[i],47);
                 text_center_button(p,names[i],tab_x[i],101,tab_w[i],47,
                                    p->font_small,.96f,.97f,.99f);
@@ -2020,6 +2060,39 @@ static void draw(Paint *p,Page page,Movie *movies,int n,int chosen,
             list_row(p,sources[i].title,UI_ROW_Y+(i-first)*UI_ROW_STEP,i==source,NULL);
         }
         footer(p,status);
+    } else if (page==DOWNLOADS) {
+        static DownloadInfo list[DOWNLOADS_MAX];
+        int count=downloads_list(list,DOWNLOADS_MAX);
+        footer_position=count?download_selected+1:0;
+        footer_total=count;
+        screen_header(p,"Завантажені","Фільми й серії без інтернету");
+        if(!count)
+            text_center_button(p,"Тут нічого немає. Завантаження: Y у списку джерел або серій",
+                               UI_EDGE,305,1216,110,p->font_small,.73f,.77f,.82f);
+        int first=download_selected/UI_ROWS*UI_ROWS;
+        for(int i=first;i<count && i<first+UI_ROWS;i++){
+            const DownloadInfo *d=&list[i];
+            char title[300],detail[64];
+            if(d->label[0])snprintf(title,sizeof(title),"%.150s · %.140s",d->title,d->label);
+            else snprintf(title,sizeof(title),"%s",d->title);
+            unsigned megabytes=(unsigned)(d->bytes>>20);
+            if(d->state==DOWNLOAD_QUEUED)snprintf(detail,sizeof(detail),"У черзі");
+            else if(d->state==DOWNLOAD_ACTIVE && d->permille<0)
+                snprintf(detail,sizeof(detail),"%u МБ",megabytes);
+            else if(d->state==DOWNLOAD_ACTIVE)
+                snprintf(detail,sizeof(detail),"%d%% · %u МБ",d->permille/10,megabytes);
+            else if(d->state==DOWNLOAD_DONE)snprintf(detail,sizeof(detail),"Готово · %u МБ",megabytes);
+            else snprintf(detail,sizeof(detail),"Помилка");
+            int y=UI_ROW_Y+(i-first)*UI_ROW_STEP;
+            list_row(p,title,y,i==download_selected,detail);
+            if(d->state==DOWNLOAD_ACTIVE && d->permille>=0)
+                box_alpha(p,UI_EDGE+12,y+UI_ROW_HEIGHT-5,(1192*d->permille)/1000,3,
+                          .36f,.62f,.98f,1.f,1);
+        }
+        const char *note=status;
+        if(count && download_selected<count && list[download_selected].state==DOWNLOAD_FAILED &&
+           !(status && *status))note=list[download_selected].error;
+        footer(p,note);
     } else if (page==SEASONS) {
         screen_header(p,"Вибір сезону","Оберіть сезон");
         int first=selected_season/UI_ROWS*UI_ROWS;
@@ -2108,6 +2181,25 @@ static void change_volume(mpv_handle *player,int direction){
     video_options[1]=volume;
     playback_set_value(player,"volume",volume);
 }
+/* Bottom control row: seek/pause on the left, then settings, audio,
+   subtitles and scale; audio and subtitles only when they offer a choice. */
+static int player_audio_choices,player_subtitle_choices;
+typedef struct { int key,center; } PlayerButton;
+static int player_buttons(PlayerButton *out){
+    static const int keys[]={SDL_CONTROLLER_BUTTON_DPAD_LEFT,SDL_CONTROLLER_BUTTON_A,
+                             SDL_CONTROLLER_BUTTON_DPAD_RIGHT,SDL_CONTROLLER_BUTTON_BACK,
+                             SDL_CONTROLLER_BUTTON_Y,SDL_CONTROLLER_BUTTON_X,
+                             SDL_CONTROLLER_BUTTON_START};
+    int count=0;
+    for(int i=0;i<7;i++){
+        if(keys[i]==SDL_CONTROLLER_BUTTON_Y && !player_audio_choices)continue;
+        if(keys[i]==SDL_CONTROLLER_BUTTON_X && !player_subtitle_choices)continue;
+        out[count].key=keys[i];
+        out[count].center=i<3?354+122*i:832+122*(count-3);
+        count++;
+    }
+    return count;
+}
 static void draw_player_controls(Paint *p,mpv_handle *player) {
     ui_theme_enabled=0; /* Video playback controls remain readable in both themes. */
     double pos=0,duration=0;
@@ -2151,27 +2243,38 @@ static void draw_player_controls(Paint *p,mpv_handle *player) {
     box_alpha(p,70+volume*178/130-7,641,14,20,.96f,.97f,.98f,1.f,7);
     char volume_label[24];snprintf(volume_label,sizeof(volume_label),"%d%%",volume);
     text_tiny(p,volume_label,122,672,100);
-    const int centers[]={354,476,598,832,954,1076,1198};
-    const char *icons[]={"−10",paused?"▶":"Ⅱ","+10","","♪","CC",""};
     int fill=video_options[7]>.5;
-    const char *labels[]={"10 с назад","Пауза / пуск","10 с вперед",
-                          "Параметри","Аудіо","Субтитри",scale_labels[fill]};
-    for(int i=0;i<7;i++){
-        const int w=76;
-        box_alpha(p,centers[i]-w/2,610,w,58,.18f,.22f,.26f,.94f,15);
-        text_center(p,icons[i],centers[i]-w/2,624,w,
-                    i==0||i==2?p->font_small:p->font,.98f,.98f,.99f);
-        if(i==3)gear_icon(p,centers[i],639,.18f,.22f,.26f);
-        text_center(p,labels[i],centers[i]-72,678,144,p->font_tiny,.78f,.84f,.89f);
+    PlayerButton buttons[7];
+    int button_count=player_buttons(buttons);
+    for(int i=0;i<button_count;i++){
+        const int w=76,cx=buttons[i].center,key=buttons[i].key;
+        const char *icon=key==SDL_CONTROLLER_BUTTON_DPAD_LEFT?"−10":
+                         key==SDL_CONTROLLER_BUTTON_A?(paused?"▶":"Ⅱ"):
+                         key==SDL_CONTROLLER_BUTTON_DPAD_RIGHT?"+10":
+                         key==SDL_CONTROLLER_BUTTON_Y?"♪":
+                         key==SDL_CONTROLLER_BUTTON_X?"CC":"";
+        const char *label=key==SDL_CONTROLLER_BUTTON_DPAD_LEFT?"10 с назад":
+                          key==SDL_CONTROLLER_BUTTON_A?"Пауза / пуск":
+                          key==SDL_CONTROLLER_BUTTON_DPAD_RIGHT?"10 с вперед":
+                          key==SDL_CONTROLLER_BUTTON_BACK?"Параметри":
+                          key==SDL_CONTROLLER_BUTTON_Y?"Аудіо":
+                          key==SDL_CONTROLLER_BUTTON_X?"Субтитри":scale_labels[fill];
+        box_alpha(p,cx-w/2,610,w,58,.18f,.22f,.26f,.94f,15);
+        text_center(p,icon,cx-w/2,624,w,
+                    key==SDL_CONTROLLER_BUTTON_DPAD_LEFT || key==SDL_CONTROLLER_BUTTON_DPAD_RIGHT?
+                    p->font_small:p->font,.98f,.98f,.99f);
+        if(key==SDL_CONTROLLER_BUTTON_BACK)gear_icon(p,cx,639,.18f,.22f,.26f);
+        if(key==SDL_CONTROLLER_BUTTON_START){
+            /* Scale: a screen frame with the picture inside it (fit) or
+               spilling past it (fill). */
+            ui_outline_width=2;
+            box_alpha(p,cx-18,627,36,24,.98f,.98f,.99f,1.f,4);
+            ui_outline_width=0;
+            if(fill)box_alpha(p,cx-24,630,48,18,.98f,.98f,.99f,.85f,2);
+            else box_alpha(p,cx-12,634,24,10,.98f,.98f,.99f,.85f,2);
+        }
+        text_center(p,label,cx-72,678,144,p->font_tiny,.78f,.84f,.89f);
     }
-    /* Scale: a screen frame with the picture inside it (fit) or spilling
-       past it (fill). */
-    int cx=centers[6],cy=639;
-    ui_outline_width=2;
-    box_alpha(p,cx-18,cy-12,36,24,.98f,.98f,.99f,1.f,4);
-    ui_outline_width=0;
-    if(fill)box_alpha(p,cx-24,cy-9,48,18,.98f,.98f,.99f,.85f,2);
-    else box_alpha(p,cx-12,cy-5,24,10,.98f,.98f,.99f,.85f,2);
     text_tiny(p,"Start — масштаб",1090,519,170);
 }
 static void draw_next_episode_prompt(Paint *p,const Episode *next,int seconds){
@@ -2228,13 +2331,7 @@ static void stick_arrow(SDL_GameController *pad,Uint32 *last_time,int *last_key)
 static void configure_stream(mpv_handle *player,const char *url) {
     if(!player)return;
     mpv_set_property_string(player,"user-agent","Mozilla/5.0 (Nintendo Switch; UAPlay/1.0)");
-    if(strstr(url,"zetvideo.net"))
-        mpv_set_property_string(player,"referrer","https://zetvideo.net/");
-    else if(strstr(url,"ashdi.vip"))
-        mpv_set_property_string(player,"referrer","https://ashdi.vip/");
-    else if(strstr(url,"hdvbua.pro"))
-        mpv_set_property_string(player,"referrer","https://hdvbua.pro/");
-    else mpv_set_property_string(player,"referrer","");
+    mpv_set_property_string(player,"referrer",stream_referer(url));
 }
 static int keyboard(char *value,size_t size) {
 #ifdef __vita__
@@ -2249,7 +2346,7 @@ static int keyboard(char *value,size_t size) {
 #endif
 }
 static const char *prof_kind_name(char kind){
-    return kind=='U'?"ui":kind=='C'?"catalog":kind=='S'?"sources":"posters";
+    return kind=='U'?"ui":kind=='C'?"catalog":kind=='S'?"sources":kind=='D'?"downloads":"posters";
 }
 static void prof_format_request(char *out,size_t size,const NetSample *n){
     char result[120]="";
@@ -2305,9 +2402,10 @@ static void prof_summarize(void){
     int ca_loaded,ca_skipped;double ca_ms;
     net_tls_stats(&ca_loaded,&ca_skipped,&ca_ms);
     PROF_LINE("network: background active %d waiting %d   requests ui %u catalog %u sources %u posters %u"
-              "   CA %d certs (%d skipped) %.0f ms",
+              " downloads %u   CA %d certs (%d skipped) %.0f ms",
               active,waiting,net_request_count('U'),net_request_count('C'),
-              net_request_count('S'),net_request_count('P'),ca_loaded,ca_skipped,ca_ms);
+              net_request_count('S'),net_request_count('P'),net_request_count('D'),
+              ca_loaded,ca_skipped,ca_ms);
     char tls[200];
     net_tls_info(tls,sizeof(tls));
     if(tls[0])PROF_LINE("%s",tls);
@@ -2447,6 +2545,63 @@ static void prof_boot_done(void){
         fflush(prof.log);
     }
 }
+/* Choices for the audio or subtitle picker: mpv's tracks, provider
+   captions mpv has not loaded, and dubs that are separate stream URLs. */
+static int collect_tracks(mpv_handle *player,int subtitles,const char *playing_url,
+                          MediaTrack *out){
+    int count=playback_tracks(player,subtitles,out,TRACKS_MAX);
+    /* Even if an external subtitle failed to load into mpv,
+       keep the provider's caption URL available for retry. */
+    if(subtitles)
+        for(int i=0;i<uakino_resolved_subtitle_count() && count<TRACKS_MAX;i++){
+            if(playback_has_external_subtitle(player,uakino_resolved_subtitle_url(i)))continue;
+            MediaTrack *choice=&out[count++];
+            choice->id=-(SOURCE_SUBTITLE_TRACK_BASE+i+1);
+            choice->selected=0;
+            snprintf(choice->label,sizeof(choice->label),"Зовнішні: %.165s",
+                     uakino_resolved_subtitle_label(i));
+        }
+    /* PlayerJS can offer separately encoded dubbed versions
+       as distinct stream URLs, not as native mpv tracks. */
+    if(!subtitles && uakino_resolved_audio_count()>1)
+        for(int i=0;i<uakino_resolved_audio_count() && count<TRACKS_MAX;i++){
+            MediaTrack *choice=&out[count++];
+            choice->id=-(SOURCE_AUDIO_TRACK_BASE+i+1);
+            choice->selected=!strcmp(playing_url,uakino_resolved_audio_url(i));
+            snprintf(choice->label,sizeof(choice->label),"Озвучка: %.165s",
+                     uakino_resolved_audio_label(i));
+        }
+    /* In Playerjs playlists, a different dub is often a
+       different HLS URL, not an mpv-embedded audio track. */
+    if(!subtitles && active_episode_variant>=0 && active_episode_variant<episode_count){
+        Episode *active=&episodes[active_episode_variant];
+        int variants=0;
+        for(int i=0;i<episode_count;i++)
+            if(episodes[i].season==active->season &&
+               episodes[i].number==active->number)variants++;
+        if(variants>1)for(int i=0;i<episode_count && count<TRACKS_MAX;i++){
+            if(episodes[i].season!=active->season ||
+               episodes[i].number!=active->number)continue;
+            MediaTrack *choice=&out[count++];
+            choice->id=-(i+1);
+            choice->selected=i==active_episode_variant;
+            snprintf(choice->label,sizeof(choice->label),"Озвучка: %.165s",
+                     episodes[i].voice[0]?episodes[i].voice:"Основна");
+        }
+    }
+    return count;
+}
+/* Whether the audio and subtitle buttons have anything to offer: more
+   than one audio choice, any subtitle besides "off". Checked about once a
+   second while the controls show. */
+static void update_track_buttons(mpv_handle *player,const char *playing_url){
+    static Uint32 checked_at;
+    if(checked_at && SDL_GetTicks()-checked_at<1000)return;
+    checked_at=SDL_GetTicks();
+    static MediaTrack scratch[TRACKS_MAX];
+    player_audio_choices=collect_tracks(player,0,playing_url,scratch)>1;
+    player_subtitle_choices=collect_tracks(player,1,playing_url,scratch)>1;
+}
 int main(void) {
     prof.ticks_per_ms=(double)SDL_GetPerformanceFrequency()/1000.0;
     boot_mark=prof_now();
@@ -2481,6 +2636,7 @@ int main(void) {
         struct stat flag;
         if(stat(UAPLAY_DATA_DIR "/profile.on",&flag)==0)prof_toggle();
     }
+    downloads_init();
     prof_boot_step(3);
 #ifdef __vita__
     /* vitaGL owns the display; SDL only supplies input, fonts and images. */
@@ -2645,13 +2801,11 @@ int main(void) {
                             playback_set_value(player,"volume",volume);
                             continue;
                         }
-                        if(tx>=307 && tx<401)key=SDL_CONTROLLER_BUTTON_DPAD_LEFT;
-                        else if(tx>=429 && tx<523)key=SDL_CONTROLLER_BUTTON_A;
-                        else if(tx>=551 && tx<645)key=SDL_CONTROLLER_BUTTON_DPAD_RIGHT;
-                        else if(tx>=785 && tx<879)key=SDL_CONTROLLER_BUTTON_BACK;
-                        else if(tx>=907 && tx<1001)key=SDL_CONTROLLER_BUTTON_Y;
-                        else if(tx>=1029 && tx<1123)key=SDL_CONTROLLER_BUTTON_X;
-                        else if(tx>=1151 && tx<1245)key=SDL_CONTROLLER_BUTTON_START;
+                        PlayerButton buttons[7];
+                        int button_count=player_buttons(buttons);
+                        for(int i=0;i<button_count;i++)
+                            if(tx>=buttons[i].center-47 && tx<buttons[i].center+47)
+                                key=buttons[i].key;
                     }else continue;
                 }else if(page==CATALOG){
                     if(ty<78 && tx>=193 && tx<742){
@@ -2680,6 +2834,10 @@ int main(void) {
                             int tab=-1;
                             if(tx>=32 && tx<228)tab=0;
                             else if(tx>=244 && tx<402)tab=1;
+                            else if(tx>=418 && tx<614){
+                                catalog_hero_focus=19;
+                                key=SDL_CONTROLLER_BUTTON_A;
+                            }
                             if(tab>=0){
                                 if(category!=11+tab){
                                     category=11+tab;
@@ -2784,6 +2942,14 @@ int main(void) {
                        slot>=0 && slot<UI_ROWS && new_source<sn){
                         source=new_source;key=SDL_CONTROLLER_BUTTON_A;
                     }else if(ty<92 && tx<100)key=SDL_CONTROLLER_BUTTON_B;
+                }else if(page==DOWNLOADS){
+                    int slot=(ty-UI_ROW_Y)/UI_ROW_STEP;
+                    int row=download_selected/UI_ROWS*UI_ROWS+slot;
+                    if(ty>=UI_ROW_Y && (ty-UI_ROW_Y)%UI_ROW_STEP<UI_ROW_HEIGHT &&
+                       slot>=0 && slot<UI_ROWS){
+                        if(row==download_selected)key=SDL_CONTROLLER_BUTTON_A;
+                        else{download_selected=row;download_confirm=0;}
+                    }else if(ty<92 && tx<100)key=SDL_CONTROLLER_BUTTON_B;
                 }else if(page==SEASONS){
                     int slot=(ty-UI_ROW_Y)/UI_ROW_STEP;
                     int next=selected_season/UI_ROWS*UI_ROWS+slot;
@@ -2862,6 +3028,9 @@ int main(void) {
                                 library_set_episode_progress(&playing_movie,
                                     episodes[active_episode_variant].season,
                                     episodes[active_episode_variant].number,position);
+                            else if(player_return_page==DOWNLOADS && download_episode)
+                                library_set_episode_progress(&playing_movie,download_season,
+                                                             download_episode,position);
                             else library_set_progress(&playing_movie,position);
                         }
                     pending_next_episode=-1;
@@ -2883,55 +3052,10 @@ int main(void) {
                 if(key==SDL_CONTROLLER_BUTTON_DPAD_RIGHT)seek(player,fast?"60":"10");
                 if(key==SDL_CONTROLLER_BUTTON_DPAD_UP)change_volume(player,1);
                 if(key==SDL_CONTROLLER_BUTTON_DPAD_DOWN)change_volume(player,-1);
-                if(key==SDL_CONTROLLER_BUTTON_X || key==SDL_CONTROLLER_BUTTON_Y){
+                if((key==SDL_CONTROLLER_BUTTON_X && player_subtitle_choices) ||
+                   (key==SDL_CONTROLLER_BUTTON_Y && player_audio_choices)){
                     subtitle_picker=key==SDL_CONTROLLER_BUTTON_X;
-                    track_count=playback_tracks(player,subtitle_picker,tracks,TRACKS_MAX);
-                    /* Even if an external subtitle failed to load into mpv,
-                       keep the provider's caption URL available for retry. */
-                    if(subtitle_picker)
-                        for(int i=0;i<uakino_resolved_subtitle_count() &&
-                            track_count<TRACKS_MAX;i++){
-                            if(playback_has_external_subtitle(player,
-                                   uakino_resolved_subtitle_url(i)))continue;
-                            MediaTrack *choice=&tracks[track_count++];
-                            choice->id=-(SOURCE_SUBTITLE_TRACK_BASE+i+1);
-                            choice->selected=0;
-                            snprintf(choice->label,sizeof(choice->label),
-                                     "Зовнішні: %.165s",
-                                     uakino_resolved_subtitle_label(i));
-                        }
-                    /* PlayerJS can offer separately encoded dubbed versions
-                       as distinct stream URLs, not as native mpv tracks. */
-                    if(!subtitle_picker && uakino_resolved_audio_count()>1)
-                        for(int i=0;i<uakino_resolved_audio_count() &&
-                            track_count<TRACKS_MAX;i++){
-                            MediaTrack *choice=&tracks[track_count++];
-                            choice->id=-(SOURCE_AUDIO_TRACK_BASE+i+1);
-                            choice->selected=!strcmp(playing_url,
-                                                      uakino_resolved_audio_url(i));
-                            snprintf(choice->label,sizeof(choice->label),
-                                     "Озвучка: %.165s",
-                                     uakino_resolved_audio_label(i));
-                        }
-                    /* In Playerjs playlists, a different dub is often a
-                       different HLS URL, not an mpv-embedded audio track. */
-                    if(!subtitle_picker && active_episode_variant>=0 &&
-                       active_episode_variant<episode_count){
-                        Episode *active=&episodes[active_episode_variant];
-                        int variants=0;
-                        for(int i=0;i<episode_count;i++)
-                            if(episodes[i].season==active->season &&
-                               episodes[i].number==active->number)variants++;
-                        if(variants>1)for(int i=0;i<episode_count && track_count<TRACKS_MAX;i++){
-                            if(episodes[i].season!=active->season ||
-                               episodes[i].number!=active->number)continue;
-                            MediaTrack *choice=&tracks[track_count++];
-                            choice->id=-(i+1);
-                            choice->selected=i==active_episode_variant;
-                            snprintf(choice->label,sizeof(choice->label),"Озвучка: %.165s",
-                                     episodes[i].voice[0]?episodes[i].voice:"Основна");
-                        }
-                    }
+                    track_count=collect_tracks(player,subtitle_picker,playing_url,tracks);
                     selected_track=0;
                     for(int i=0;i<track_count;i++) if(tracks[i].selected)selected_track=i;
                     page=TRACK_PICKER;
@@ -3052,6 +3176,23 @@ int main(void) {
             }
             if(page==EPISODES){
                 if(key==SDL_CONTROLLER_BUTTON_B)page=SEASONS;
+                if(key==SDL_CONTROLLER_BUTTON_Y && !open_pending()){
+                    Episode *episode=selected_episode_item();
+                    if(episode){
+                        Source episode_source={0};
+                        snprintf(episode_source.url,sizeof(episode_source.url),"%s",episode->url);
+                        OpenResult request={0};
+                        request.download=1;
+                        request.movie=movies[chosen];
+                        request.season=episode->season;
+                        request.episode=episode->number;
+                        snprintf(request.label,sizeof(request.label),"Сезон %d · Серія %d%s%.60s",
+                                 episode->season,episode->number,episode->voice[0]?" · ":"",
+                                 episode->voice);
+                        if(open_start(&episode_source,0,&request))
+                            snprintf(message,sizeof(message),"Підготовка завантаження...");
+                    }
+                }
                 if(key==SDL_CONTROLLER_BUTTON_DPAD_UP && selected_episode>0)selected_episode--;
                 if(key==SDL_CONTROLLER_BUTTON_DPAD_DOWN &&
                    selected_episode<episodes_in_season(season_ids[selected_season])-1)selected_episode++;
@@ -3080,6 +3221,62 @@ int main(void) {
                             player_return_page=EPISODES;page=PLAYER;
                         }
                     } else if(!render) snprintf(message,sizeof(message),"Плеєр mpv не ініціалізовано");
+                }
+                continue;
+            }
+            if(page==DOWNLOADS){
+                static DownloadInfo list[DOWNLOADS_MAX];
+                int count=downloads_list(list,DOWNLOADS_MAX);
+                if(download_selected>=count)download_selected=count?count-1:0;
+                if(key==SDL_CONTROLLER_BUTTON_B){
+                    page=CATALOG;download_confirm=0;message[0]=0;continue;
+                }
+                if(key==SDL_CONTROLLER_BUTTON_DPAD_UP && download_selected>0)
+                    {download_selected--;download_confirm=0;}
+                if(key==SDL_CONTROLLER_BUTTON_DPAD_DOWN && download_selected<count-1)
+                    {download_selected++;download_confirm=0;}
+                if(key==SDL_CONTROLLER_BUTTON_A && count){
+                    const DownloadInfo *info=&list[download_selected];
+                    static Download item;
+                    if(info->state==DOWNLOAD_FAILED){
+                        downloads_retry(info->id);
+                        snprintf(message,sizeof(message),"Завантаження повторюється");
+                    }else if(info->state!=DOWNLOAD_DONE){
+                        snprintf(message,sizeof(message),"Ще завантажується");
+                    }else if(!render){
+                        snprintf(message,sizeof(message),"Плеєр mpv не ініціалізовано");
+                    }else if(downloads_get(info->id,&item)){
+                        char path[256];
+                        downloads_play_path(&item,path,sizeof(path));
+                        playing_movie=item.movie;
+                        active_episode_variant=-1;
+                        download_season=item.season;download_episode=item.episode;
+                        int saved_season=0,saved_episode=0;
+                        double saved_seconds=0;
+                        resume_at=!item.episode?library_progress(&playing_movie):
+                            (library_last_episode(&playing_movie,&saved_season,&saved_episode,
+                                                  &saved_seconds) &&
+                             saved_season==item.season && saved_episode==item.episode)?
+                            saved_seconds:0;
+                        pending_subtitle[0]=0;message[0]=0;
+                        snprintf(playing_url,sizeof(playing_url),"%s",path);
+                        configure_stream(player,path);
+                        command(player,"loadfile",path);
+                        video_started_at=SDL_GetTicks();video_loaded=0;
+                        controls_until=SDL_GetTicks()+3000;
+                        player_return_page=DOWNLOADS;page=PLAYER;
+                    }
+                }
+                if(key==SDL_CONTROLLER_BUTTON_X && count){
+                    unsigned id=list[download_selected].id;
+                    if(download_confirm!=id){
+                        download_confirm=id;
+                        snprintf(message,sizeof(message),"Натисніть ще раз, щоб видалити");
+                    }else{
+                        downloads_remove(id);
+                        download_confirm=0;
+                        snprintf(message,sizeof(message),"Видалено");
+                    }
                 }
                 continue;
             }
@@ -3164,11 +3361,14 @@ int main(void) {
                 }
                 if(!expanded_catalog && (category==11 || category==12)){
                     if(catalog_hero_focus>=16){
-                        if(key==SDL_CONTROLLER_BUTTON_DPAD_LEFT && catalog_hero_focus>16)
-                            catalog_hero_focus--;
-                        if(key==SDL_CONTROLLER_BUTTON_DPAD_RIGHT &&
-                           catalog_hero_focus<(category==12?18:17))
-                            catalog_hero_focus++;
+                        /* Sub-tabs left to right, then "clear history". */
+                        const int order[]={16,17,19,18};
+                        int length=category==12?4:3,at=0;
+                        for(int i=0;i<length;i++)if(order[i]==catalog_hero_focus)at=i;
+                        if(key==SDL_CONTROLLER_BUTTON_DPAD_LEFT && at>0)
+                            catalog_hero_focus=order[at-1];
+                        if(key==SDL_CONTROLLER_BUTTON_DPAD_RIGHT && at<length-1)
+                            catalog_hero_focus=order[at+1];
                         if(key==SDL_CONTROLLER_BUTTON_DPAD_UP)catalog_hero_focus=11;
                         if(key==SDL_CONTROLLER_BUTTON_DPAD_DOWN && n)
                             catalog_hero_focus=0;
@@ -3264,6 +3464,9 @@ int main(void) {
                             snprintf(message,sizeof(message),
                                      "Історію очищено (%d записів)",removed);
                         }
+                    }else if(!expanded_catalog && (category==11 || category==12) &&
+                             catalog_hero_focus==19){
+                        page=DOWNLOADS;download_selected=0;download_confirm=0;message[0]=0;
                     }else if(catalog_hero_focus>=7 && catalog_hero_focus<=11){
                         category=category_for_tab(catalog_hero_focus-7);
                         if(category==0)home_shelf=0;
@@ -3383,14 +3586,35 @@ int main(void) {
                     active_episode_variant=-1;
                     if(!render && !movies[chosen].series){
                         snprintf(message,sizeof(message),"Плеєр mpv не ініціалізовано");
-                    }else if(open_start(&sources[source],movies[chosen].series)){
+                    }else if(open_start(&sources[source],movies[chosen].series,NULL)){
                         snprintf(message,sizeof(message),"Відкриття джерела...");
+                    }
+                }
+                if(key==SDL_CONTROLLER_BUTTON_Y && sn && !open_pending()){
+                    if(movies[chosen].series)
+                        snprintf(message,sizeof(message),"Відкрийте джерело й завантажте окрему серію");
+                    else{
+                        OpenResult request={0};
+                        request.download=1;
+                        request.movie=movies[chosen];
+                        if(open_start(&sources[source],0,&request))
+                            snprintf(message,sizeof(message),"Підготовка завантаження...");
                     }
                 }
             }
         }
         OpenResult opened;
-        if(open_poll(&opened) && page==SOURCES && sn){
+        int opened_ready=open_poll(&opened);
+        if(opened_ready && opened.download){
+            if(!opened.resolved)
+                snprintf(message,sizeof(message),"Не вдалося отримати відео: %.200s",opened.message);
+            else{
+                int added=downloads_add(&opened.movie,opened.season,opened.episode,
+                                        opened.label,opened.url);
+                snprintf(message,sizeof(message),"%s",added>0?"Додано до завантажень":
+                         added==0?"Вже є у завантаженнях":"Список завантажень заповнений");
+            }
+        }else if(opened_ready && page==SOURCES && sn){
             snprintf(message,sizeof(message),"%s",opened.message);
             if(opened.episodes){
                 episode_count=opened.episodes;
@@ -3465,6 +3689,9 @@ int main(void) {
                             library_set_episode_progress(&playing_movie,
                                 episodes[active_episode_variant].season,
                                 episodes[active_episode_variant].number,0);
+                        else if(player_return_page==DOWNLOADS && download_episode)
+                            library_set_episode_progress(&playing_movie,download_season,
+                                                         download_episode,0);
                         int following=player_return_page==EPISODES &&
                                       active_episode_variant>=0 ?
                             catalog_next_episode(episodes,episode_count,
@@ -3492,6 +3719,9 @@ int main(void) {
                     library_set_episode_progress(&playing_movie,
                         episodes[active_episode_variant].season,
                         episodes[active_episode_variant].number,seconds);
+                else if(player_return_page==DOWNLOADS && download_episode)
+                    library_set_episode_progress(&playing_movie,download_season,
+                                                 download_episode,seconds);
                 else library_set_progress(&playing_movie,seconds);
                 history_playback_committed=1;
             }
@@ -3549,6 +3779,8 @@ int main(void) {
         net_background_pause(watching_video);
 #ifdef __vita__
         vita_media_tick(watching_video);
+        /* Standby would drop Wi-Fi in the middle of a download. */
+        vita_keep_awake_tick(!watching_video && downloads_busy());
 #else
         if(watching_video!=media_playback_mode){
             appletSetMediaPlaybackState(watching_video!=0);
@@ -3629,7 +3861,10 @@ int main(void) {
                 }
             }
 #endif
-            if(video_loaded && SDL_GetTicks()<controls_until)draw_player_controls(&paint,player);
+            if(video_loaded && SDL_GetTicks()<controls_until){
+                update_track_buttons(player,playing_url);
+                draw_player_controls(&paint,player);
+            }
             if(pending_next_episode>=0){
                 Uint32 elapsed=SDL_GetTicks()-next_episode_countdown_at;
                 int remaining=elapsed<NEXT_EPISODE_DELAY_MS?
@@ -3685,6 +3920,7 @@ int main(void) {
     if(media_playback_mode)appletSetMediaPlaybackState(false);
 #endif
     net_background_shutdown();
+    downloads_shutdown();
     if(prof.log){fclose(prof.log);prof.log=NULL;}
     catalog_loader_shutdown();
     free(movies);

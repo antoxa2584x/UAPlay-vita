@@ -173,6 +173,12 @@ void vita_media_tick(int watching) {
     }
 }
 
+void vita_keep_awake_tick(int awake) {
+    static unsigned frames;
+    if (awake && ++frames % 60 == 0)
+        sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND);
+}
+
 void vita_swap(void) {
     vglSwapBuffers(GL_FALSE);
     /* Not every screen paints the whole display (menus over a paused

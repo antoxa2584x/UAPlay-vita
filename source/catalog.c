@@ -83,7 +83,7 @@ static HttpThread *http_thread(void){
 
 #define NET_SAMPLES 128
 static NetSample net_samples[NET_SAMPLES];
-static unsigned net_sequence,net_counts[4];
+static unsigned net_sequence,net_counts[5];
 #ifdef UAPLAY_CONSOLE
 static SDL_SpinLock net_profile_lock;
 #define NET_PROFILE_LOCK() SDL_AtomicLock(&net_profile_lock)
@@ -95,7 +95,7 @@ static unsigned net_ticks(void){return SDL_GetTicks();}
 static unsigned net_ticks(void){return 0;}
 #endif
 static int net_kind_index(char kind){
-    return kind=='U'?0:kind=='C'?1:kind=='S'?2:3;
+    return kind=='U'?0:kind=='C'?1:kind=='S'?2:kind=='D'?4:3;
 }
 void net_profile_record(char kind,void *handle,const char *url,unsigned wait_ms,
                         int result,unsigned bytes,const char *error){

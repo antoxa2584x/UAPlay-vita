@@ -43,7 +43,6 @@ typedef struct {
    source prefetch. Call cleanup only after the loader thread has stopped. */
 void catalog_http_init(void);
 void catalog_http_cleanup(void);
-/* Give the calling thread (the source prefetch worker) its own pool. */
 /* Roles for the calling thread: a source search worker (queued
    background, served first) or a foreground job the user waits on (never
    queued). Other non-UI threads count as catalogue background work. */
@@ -64,7 +63,7 @@ void net_background_shutdown(void);
 void net_background_stats(int *active,int *waiting);
 
 /* Request timings for the profiler. Kinds: 'U' UI thread, 'C' catalogue
-   worker, 'S' source prefetch, 'P' posters. Times are milliseconds; tls
+   worker, 'S' source prefetch, 'P' posters, 'D' downloads. Times are milliseconds; tls
    and connect are 0 when a kept-alive connection was reused. */
 typedef struct {
     unsigned sequence,at;

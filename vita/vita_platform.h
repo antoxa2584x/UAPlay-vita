@@ -18,6 +18,8 @@ int vita_keyboard(char *value, size_t size);
 int vita_enter_is_circle(void);
 /* Keep the screen on and the console awake while a video plays. */
 void vita_media_tick(int watching);
+/* Keep the console out of auto standby (the screen may still dim). */
+void vita_keep_awake_tick(int awake);
 void vita_swap(void);
 /* Feed front touch panel input into the SDL event queue. */
 void vita_poll_touch(void);
